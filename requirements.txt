@@ -1,0 +1,14 @@
+# SUNARP Vehicle Consultation API Dependencies
+
+# Browser automation with Cloudflare bypass
+pydoll-python>=1.0.0
+
+# API Framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# Async utilities
+aiofiles>=23.0.0
+
+# For image handling
+pillow>=10.0.0
