@@ -249,7 +249,13 @@ class SunarpScraper:
             print(f"[INFO] Filling plate number: {placa}")
             await self._fill_plate_input(tab, placa)
             
+            # Wait for captcha to complete and button to enable
             await asyncio.sleep(10)
+            
+            # Reset the response state before clicking (ignore any previous API calls)
+            self._api_response = None
+            self._response_event.clear()
+            self._pending_request_id = None
             
             print(f"[INFO] Clicking search button...")
             await self._click_search_button(tab)
@@ -717,49 +723,80 @@ class SunarpScraper:
         raise Exception("Could not find plate input field")
     
     async def _click_search_button(self, tab):
-        """Click the search/busqueda button."""
+        """Click the search/busqueda button after waiting for it to be enabled."""
+        
+        # Selectors for the SUNARP search button (ng-zorro/antd button)
         selectors = [
+            "button.btn-sunarp-green",
+            "button.ant-btn-primary",
+            "button[nz-button]",
             "button[type='submit']",
-            "button.btn-buscar",
-            "button.search-btn",
         ]
         
+        max_wait = 30  # Maximum seconds to wait for button to be enabled
+        poll_interval = 0.5
+        
+        print(f"[INFO] Waiting for search button to be enabled...")
+        
+        for elapsed in range(int(max_wait / poll_interval)):
+            for selector in selectors:
+                try:
+                    btn = await tab.query(selector, timeout=0, raise_exc=False)
+                    if btn:
+                        # Check if button is disabled using JavaScript
+                        is_disabled = await tab.execute_script(
+                            f"return document.querySelector('{selector}')?.disabled || "
+                            f"document.querySelector('{selector}')?.getAttribute('disabled') === 'true'"
+                        )
+                        
+                        if not is_disabled:
+                            await btn.click()
+                            print(f"[INFO] Search button clicked using selector: {selector}")
+                            return
+                        else:
+                            print(f"[DEBUG] Button found but disabled, waiting...")
+                            break  # Found button, just wait for it to enable
+                except Exception as e:
+                    continue
+            
+            await asyncio.sleep(poll_interval)
+        
+        # Final attempt: try clicking even if disabled check failed
         for selector in selectors:
             try:
                 btn = await tab.query(selector, timeout=0, raise_exc=False)
                 if btn:
-                    await btn.click()
-                    print(f"[INFO] Search button clicked using selector: {selector}")
+                    # Try clicking via JavaScript as fallback
+                    await tab.execute_script(
+                        f"document.querySelector('{selector}')?.click()"
+                    )
+                    print(f"[INFO] Search button clicked via JS using selector: {selector}")
                     return
             except Exception:
                 continue
         
-        # Fallback: find button by text
-        btn = await tab.find(
-            tag_name="button",
-            text="Búsqueda",
-            timeout=0,
-            raise_exc=False
-        )
-        if btn:
-            await btn.click()
-            print("[INFO] Search button clicked using text match")
-            return
+        # Try finding by text content
+        try:
+            result = await tab.execute_script("""
+                const buttons = document.querySelectorAll('button');
+                for (const btn of buttons) {
+                    const text = btn.innerText || btn.textContent || '';
+                    if (text.toLowerCase().includes('busqueda') || text.toLowerCase().includes('buscar')) {
+                        if (!btn.disabled) {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            """)
+            if result:
+                print("[INFO] Search button clicked via JS text search")
+                return
+        except Exception as e:
+            print(f"[DEBUG] JS text search failed: {e}")
         
-        # Try with lowercase/partial match via query for all buttons
-        buttons = await tab.query("button", find_all=True, timeout=0, raise_exc=False)
-        if buttons:
-            for btn in buttons:
-                try:
-                    text = await btn.get_element_text()
-                    if text and ("busqueda" in text.lower() or "buscar" in text.lower()):
-                        await btn.click()
-                        print("[INFO] Search button clicked using text search")
-                        return
-                except Exception:
-                    continue
-        
-        raise Exception("Could not find search button")
+        raise Exception("Could not find or click search button")
     
     async def _process_api_response(self, response_data: Dict[str, Any], placa: str) -> ConsultaResult:
         """Process the intercepted API response and save the image."""
