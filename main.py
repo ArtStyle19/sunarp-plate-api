@@ -11,25 +11,47 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from scraper import SunarpScraper, ConsultaResult, DOWNLOADS_DIR
 
+# Load environment variables from .env file
+load_dotenv()
+
+# Configuration via environment variables
+HEADLESS_MODE = os.getenv("SUNARP_HEADLESS", "false").lower() == "true"
+SLOW_MODE = os.getenv("SUNARP_SLOW_MODE", "false").lower() == "true"
+API_HOST = os.getenv("SUNARP_HOST", "0.0.0.0")
+API_PORT = int(os.getenv("SUNARP_PORT", "8000"))
 
 # Global scraper instance (single request at a time)
 scraper: Optional[SunarpScraper] = None
 scraper_lock = asyncio.Lock()
 
 
-def get_scraper() -> SunarpScraper:
+def get_scraper(headless: bool = None, slow_mode: bool = None) -> SunarpScraper:
     """Get or create the scraper instance."""
     global scraper
-    if scraper is None:
-        # Set headless=False for visible browser (as requested)
-        scraper = SunarpScraper(headless=False)
+    
+    # Use environment defaults if not specified
+    use_headless = headless if headless is not None else HEADLESS_MODE
+    use_slow_mode = slow_mode if slow_mode is not None else SLOW_MODE
+    
+    # Recreate scraper if settings changed
+    if scraper is None or scraper.headless != use_headless or scraper.slow_mode != use_slow_mode:
+        scraper = SunarpScraper(headless=use_headless, slow_mode=use_slow_mode)
+        mode_info = []
+        if use_headless:
+            mode_info.append("headless")
+        if use_slow_mode:
+            mode_info.append("slow-mode")
+        mode_str = " (" + ", ".join(mode_info) + ")" if mode_info else ""
+        print(f"[INFO] Created scraper instance{mode_str}")
+    
     return scraper
 
 
@@ -125,6 +147,7 @@ async def consultar_vehiculo(
     placa: str,
     background_tasks: BackgroundTasks,
     download: bool = True,
+    slow: bool = Query(False, description="Use longer timeouts for slow internet connections"),
 ):
     """
     Query vehicle information from SUNARP by plate number.
@@ -132,6 +155,7 @@ async def consultar_vehiculo(
     Args:
         placa: Vehicle plate number (e.g., "ABC123")
         download: If True, return the image file. If False, return JSON with file path.
+        slow: If True, use longer timeouts for slow internet connections.
     
     Returns:
         The vehicle information image or JSON with the file path.
@@ -147,10 +171,10 @@ async def consultar_vehiculo(
     # Use lock to ensure only one request at a time
     async with scraper_lock:
         try:
-            print(f"\n[API] Starting consultation for plate: {placa}")
+            print(f"\n[API] Starting consultation for plate: {placa}" + (" [slow mode]" if slow else ""))
             
             # Get scraper and perform consultation
-            scraper_instance = get_scraper()
+            scraper_instance = get_scraper(slow_mode=slow)
             result: ConsultaResult = await scraper_instance.consultar_placa(placa)
             
             if not result.success:
@@ -207,15 +231,23 @@ async def consultar_vehiculo(
 
 
 @app.get("/consulta/{placa}/json")
-async def consultar_vehiculo_json(placa: str, background_tasks: BackgroundTasks):
+async def consultar_vehiculo_json(
+    placa: str,
+    background_tasks: BackgroundTasks,
+    slow: bool = Query(False, description="Use longer timeouts for slow internet connections"),
+):
     """
     Query vehicle and return JSON response with file path instead of the image.
     """
-    return await consultar_vehiculo(placa, background_tasks, download=False)
+    return await consultar_vehiculo(placa, background_tasks, download=False, slow=slow)
 
 
 @app.get("/consulta/{placa}/full")
-async def consultar_vehiculo_full(placa: str, background_tasks: BackgroundTasks):
+async def consultar_vehiculo_full(
+    placa: str,
+    background_tasks: BackgroundTasks,
+    slow: bool = Query(False, description="Use longer timeouts for slow internet connections"),
+):
     """
     Query vehicle and return complete metadata including sedes, alerts, and image path.
     
@@ -227,6 +259,7 @@ async def consultar_vehiculo_full(placa: str, background_tasks: BackgroundTasks)
     
     Args:
         placa: Vehicle plate number (e.g., "ABC123")
+        slow: If True, use longer timeouts for slow internet connections.
     
     Returns:
         JSON with complete vehicle consultation data.
@@ -242,10 +275,10 @@ async def consultar_vehiculo_full(placa: str, background_tasks: BackgroundTasks)
     # Use lock to ensure only one request at a time
     async with scraper_lock:
         try:
-            print(f"\n[API] Starting full consultation for plate: {placa}")
+            print(f"\n[API] Starting full consultation for plate: {placa}" + (" [slow mode]" if slow else ""))
             
             # Get scraper and perform consultation
-            scraper_instance = get_scraper()
+            scraper_instance = get_scraper(slow_mode=slow)
             result: ConsultaResult = await scraper_instance.consultar_placa(placa)
             
             # Schedule cleanup of old images
@@ -320,20 +353,25 @@ def main():
     print("=" * 60)
     print("SUNARP Vehicle Consultation API")
     print("=" * 60)
-    print("\nStarting server...")
-    print("API will be available at: http://localhost:8000")
-    print("Documentation at: http://localhost:8000/docs")
+    print(f"\nConfiguration (from .env):")
+    print(f"  SUNARP_HEADLESS: {HEADLESS_MODE}")
+    print(f"  SUNARP_SLOW_MODE: {SLOW_MODE}")
+    print(f"  SUNARP_HOST: {API_HOST}")
+    print(f"  SUNARP_PORT: {API_PORT}")
+    print(f"\nStarting server...")
+    print(f"API will be available at: http://{API_HOST}:{API_PORT}")
+    print(f"Documentation at: http://{API_HOST}:{API_PORT}/docs")
     print("\nExample usage:")
-    print("  curl http://localhost:8000/consulta/ABC123 -o result.png")
-    print("  curl http://localhost:8000/consulta/ABC123/json")
-    print("  curl http://localhost:8000/consulta/ABC123/full  # Complete metadata")
+    print(f"  curl http://localhost:{API_PORT}/consulta/ABC123 -o result.png")
+    print(f"  curl http://localhost:{API_PORT}/consulta/ABC123/json")
+    print(f"  curl http://localhost:{API_PORT}/consulta/ABC123/full  # Complete metadata")
     print("\nPress Ctrl+C to stop the server")
     print("=" * 60 + "\n")
     
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
-        port=8000,
+        host=API_HOST,
+        port=API_PORT,
         reload=False,
         log_level="info",
     )

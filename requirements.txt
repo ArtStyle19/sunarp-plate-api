@@ -12,3 +12,6 @@ aiofiles>=23.0.0
 
 # For image handling
 pillow>=10.0.0
+
+# Environment variables
+python-dotenv>=1.0.0

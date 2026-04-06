@@ -27,10 +27,11 @@ SUNARP_API_ENDPOINT = "getDatosVehiculo"
 DOWNLOADS_DIR = Path(__file__).parent / "downloads"
 CHROMIUM_PATH = "/usr/bin/chromium-browser"
 
-# Timeouts (in seconds)
-PAGE_LOAD_TIMEOUT = 30
-CLOUDFLARE_TIMEOUT = 120
-RESULT_TIMEOUT = 60
+# Timeouts (in seconds) - generous for slow connections
+PAGE_LOAD_TIMEOUT = 60       # Increased for slow internet
+CLOUDFLARE_TIMEOUT = 180     # Turnstile can be slow on bad connections
+RESULT_TIMEOUT = 90          # API response timeout
+CAPTCHA_WAIT_TIMEOUT = 60    # Time to wait for captcha to auto-solve
 
 
 @dataclass
@@ -102,14 +103,17 @@ class ConsultaResult:
 class SunarpScraper:
     """Scraper for SUNARP vehicle consultation page with API interception."""
     
-    def __init__(self, headless: bool = False):
+    def __init__(self, headless: bool = False, slow_mode: bool = False):
         """
         Initialize the scraper.
         
         Args:
             headless: If True, run browser without visible window.
+                      Note: Headless mode may fail with Cloudflare Turnstile.
+            slow_mode: If True, use longer delays for slow internet connections.
         """
         self.headless = headless
+        self.slow_mode = slow_mode
         self.downloads_dir = DOWNLOADS_DIR
         self.downloads_dir.mkdir(exist_ok=True)
         self._api_response: Optional[Dict[str, Any]] = None
@@ -178,9 +182,20 @@ class SunarpScraper:
         # Block notifications
         options.block_notifications = True
         
-        # Headless mode if requested
+        # === Headless mode configuration ===
         if self.headless:
-            options.headless = True
+            # Use the "new" headless mode which is harder to detect
+            # --headless=new is available in Chrome 109+
+            options.add_argument("--headless=new")
+            
+            # Additional headless-specific anti-detection
+            options.add_argument("--disable-gpu")  # Recommended for headless
+            
+            # Disable headless-specific features that can be detected
+            options.add_argument("--disable-extensions")
+            
+            print("[WARN] Running in headless mode - Cloudflare Turnstile may not complete!")
+            print("[WARN] If captcha fails, try running with headless=False")
         
         return options
     
@@ -214,6 +229,10 @@ class SunarpScraper:
             tab = await browser.start()
             self._tab = tab
             
+            # Adaptive delays based on slow_mode
+            nav_delay = 4 if self.slow_mode else 2      # After navigation
+            result_timeout = RESULT_TIMEOUT * 1.5 if self.slow_mode else RESULT_TIMEOUT
+            
             # Enable page events to track navigation
             print(f"[INFO] Enabling page events...")
             await tab.enable_page_events()
@@ -236,21 +255,17 @@ class SunarpScraper:
             # Navigate to the base domain first (helps with session/cookies)
             print(f"[INFO] Navigating to base domain...")
             await tab.go_to("https://consultavehicular.sunarp.gob.pe/")
-            await asyncio.sleep(3)
-            
-            # # Now navigate to the consultation page
-            # print(f"[INFO] Navigating to SUNARP consultation page...")
-            # await tab.go_to(SUNARP_URL)
-            # await asyncio.sleep(4)
+            await asyncio.sleep(nav_delay)
             
             print(f"[INFO] Waiting for page elements to load...")
-            await self._wait_for_cloudflare(tab)
+            cf_timeout = CLOUDFLARE_TIMEOUT * 1.5 if self.slow_mode else CLOUDFLARE_TIMEOUT
+            await self._wait_for_cloudflare(tab, timeout=int(cf_timeout))
             
             print(f"[INFO] Filling plate number: {placa}")
             await self._fill_plate_input(tab, placa)
             
-            # Wait for captcha to complete and button to enable
-            await asyncio.sleep(10)
+            # Small delay after typing to let Angular process the input
+            await asyncio.sleep(0.5)
             
             # Reset the response state before clicking (ignore any previous API calls)
             self._api_response = None
@@ -265,7 +280,7 @@ class SunarpScraper:
             try:
                 await asyncio.wait_for(
                     self._wait_for_api_response(tab),
-                    timeout=RESULT_TIMEOUT
+                    timeout=result_timeout
                 )
             except asyncio.TimeoutError:
                 return ConsultaResult(
@@ -723,78 +738,141 @@ class SunarpScraper:
         raise Exception("Could not find plate input field")
     
     async def _click_search_button(self, tab):
-        """Click the search/busqueda button after waiting for it to be enabled."""
+        """Click the search/busqueda button after waiting for Turnstile captcha to complete."""
         
-        # Selectors for the SUNARP search button (ng-zorro/antd button)
-        selectors = [
-            "button.btn-sunarp-green",
-            "button.ant-btn-primary",
-            "button[nz-button]",
-            "button[type='submit']",
-        ]
+        # Helper to extract value from execute_script result
+        def get_script_value(result):
+            """Extract the actual value from pydoll's execute_script response."""
+            if isinstance(result, dict):
+                if 'result' in result:
+                    inner = result['result']
+                    if isinstance(inner, dict) and 'result' in inner:
+                        inner = inner['result']
+                    if isinstance(inner, dict) and 'value' in inner:
+                        return inner['value']
+                    return inner
+            return result
         
-        max_wait = 30  # Maximum seconds to wait for button to be enabled
-        poll_interval = 0.5
+        # Fast captcha detection with shorter polling
+        max_captcha_wait = 30 if self.slow_mode else 15  # Reduced from 30s
+        poll_interval = 0.2  # Faster polling (was 0.5s)
         
-        print(f"[INFO] Waiting for search button to be enabled...")
+        print("[INFO] Waiting for Turnstile captcha...")
         
-        for elapsed in range(int(max_wait / poll_interval)):
-            for selector in selectors:
-                try:
-                    btn = await tab.query(selector, timeout=0, raise_exc=False)
-                    if btn:
-                        # Check if button is disabled using JavaScript
-                        is_disabled = await tab.execute_script(
-                            f"return document.querySelector('{selector}')?.disabled || "
-                            f"document.querySelector('{selector}')?.getAttribute('disabled') === 'true'"
-                        )
-                        
-                        if not is_disabled:
-                            await btn.click()
-                            print(f"[INFO] Search button clicked using selector: {selector}")
-                            return
-                        else:
-                            print(f"[DEBUG] Button found but disabled, waiting...")
-                            break  # Found button, just wait for it to enable
-                except Exception as e:
-                    continue
+        captcha_completed = False
+        start_time = asyncio.get_event_loop().time()
+        
+        while (asyncio.get_event_loop().time() - start_time) < max_captcha_wait:
+            try:
+                # Combined check: captcha token OR button already enabled
+                check_result = await tab.execute_script("""
+                    // Check for Turnstile response token
+                    const turnstileInput = document.querySelector('input[name="cf-turnstile-response"]');
+                    const hasToken = turnstileInput && turnstileInput.value && turnstileInput.value.length > 10;
+                    
+                    // Check if button is already enabled
+                    const btn = document.querySelector('button.btn-sunarp-green');
+                    const btnEnabled = btn && !btn.disabled;
+                    
+                    // Check if turnstile iframe exists (still loading)
+                    const turnstileFrame = document.querySelector('iframe[src*="turnstile"]');
+                    const hasTurnstile = !!turnstileFrame;
+                    
+                    return JSON.stringify({
+                        hasToken: hasToken,
+                        tokenLength: hasToken ? turnstileInput.value.length : 0,
+                        btnEnabled: btnEnabled,
+                        hasTurnstile: hasTurnstile
+                    });
+                """)
+                
+                status = get_script_value(check_result)
+                if isinstance(status, str):
+                    import json
+                    status = json.loads(status)
+                
+                # If we have token OR button is enabled, we're good
+                if status.get('hasToken') or status.get('btnEnabled'):
+                    elapsed = asyncio.get_event_loop().time() - start_time
+                    if status.get('hasToken'):
+                        print(f"[INFO] Captcha completed in {elapsed:.1f}s (token: {status.get('tokenLength')} chars)")
+                    else:
+                        print(f"[INFO] Button enabled in {elapsed:.1f}s")
+                    captcha_completed = True
+                    break
+                
+                # If no turnstile at all, proceed
+                if not status.get('hasTurnstile'):
+                    print("[INFO] No Turnstile detected, proceeding...")
+                    captcha_completed = True
+                    break
+                    
+            except Exception as e:
+                pass  # Silent retry
             
             await asyncio.sleep(poll_interval)
         
-        # Final attempt: try clicking even if disabled check failed
-        for selector in selectors:
-            try:
-                btn = await tab.query(selector, timeout=0, raise_exc=False)
-                if btn:
-                    # Try clicking via JavaScript as fallback
-                    await tab.execute_script(
-                        f"document.querySelector('{selector}')?.click()"
-                    )
-                    print(f"[INFO] Search button clicked via JS using selector: {selector}")
-                    return
-            except Exception:
-                continue
+        if not captcha_completed:
+            print("[WARN] Captcha wait timed out, attempting click anyway...")
         
-        # Try finding by text content
-        try:
-            result = await tab.execute_script("""
-                const buttons = document.querySelectorAll('button');
-                for (const btn of buttons) {
-                    const text = btn.innerText || btn.textContent || '';
-                    if (text.toLowerCase().includes('busqueda') || text.toLowerCase().includes('buscar')) {
-                        if (!btn.disabled) {
-                            btn.click();
-                            return true;
-                        }
-                    }
+        # Minimal delay before clicking
+        await asyncio.sleep(0.3)
+        
+        # Click the button
+        print("[INFO] Clicking search button...")
+        
+        result = await tab.execute_script("""
+            const btn = document.querySelector('button.btn-sunarp-green');
+            if (btn) {
+                btn.disabled = false;
+                btn.removeAttribute('disabled');
+                btn.click();
+                return 'clicked';
+            }
+            return 'not-found';
+        """)
+        clicked = get_script_value(result)
+        
+        if clicked == 'clicked':
+            print("[INFO] Search button clicked")
+            return
+        
+        # Fallback: try ant-btn-primary
+        result = await tab.execute_script("""
+            const btn = document.querySelector('button.ant-btn-primary');
+            if (btn) {
+                btn.disabled = false;
+                btn.removeAttribute('disabled');
+                btn.click();
+                return 'clicked';
+            }
+            return 'not-found';
+        """)
+        clicked = get_script_value(result)
+        
+        if clicked == 'clicked':
+            print("[INFO] Search button clicked (fallback)")
+            return
+        
+        # Last resort: find by text
+        result = await tab.execute_script("""
+            const buttons = document.querySelectorAll('button');
+            for (const btn of buttons) {
+                const text = (btn.innerText || '').toLowerCase();
+                if (text.includes('busqueda') || text.includes('buscar')) {
+                    btn.disabled = false;
+                    btn.removeAttribute('disabled');
+                    btn.click();
+                    return 'clicked';
                 }
-                return false;
-            """)
-            if result:
-                print("[INFO] Search button clicked via JS text search")
-                return
-        except Exception as e:
-            print(f"[DEBUG] JS text search failed: {e}")
+            }
+            return 'not-found';
+        """)
+        clicked = get_script_value(result)
+        
+        if clicked == 'clicked':
+            print("[INFO] Search button clicked (by text)")
+            return
         
         raise Exception("Could not find or click search button")
     
@@ -854,9 +932,28 @@ class SunarpScraper:
 
 async def main():
     """Test the scraper directly."""
-    scraper = SunarpScraper(headless=False)
+    import sys
     
-    placa = input("Enter plate number to query: ").strip()
+    # Parse command-line arguments
+    headless = "--headless" in sys.argv
+    slow_mode = "--slow" in sys.argv
+    
+    if headless:
+        print("[INFO] Running in HEADLESS mode")
+    if slow_mode:
+        print("[INFO] Running in SLOW mode (longer timeouts)")
+    
+    scraper = SunarpScraper(headless=headless, slow_mode=slow_mode)
+    
+    # Get plate from argument or prompt
+    placa = None
+    for arg in sys.argv[1:]:
+        if not arg.startswith("--"):
+            placa = arg
+            break
+    
+    if not placa:
+        placa = input("Enter plate number to query: ").strip()
     if not placa:
         placa = "ABC123"
     
@@ -879,4 +976,9 @@ async def main():
 
 
 if __name__ == "__main__":
+    print("Usage: python scraper.py [PLATE] [--headless] [--slow]")
+    print("  PLATE: Vehicle plate number (e.g., ABC123)")
+    print("  --headless: Run browser without visible window (may fail with Turnstile)")
+    print("  --slow: Use longer timeouts for slow internet connections")
+    print()
     asyncio.run(main())

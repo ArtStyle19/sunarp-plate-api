@@ -8,7 +8,10 @@ __pycache__/
 venv/
 ENV/
 env/
+
+# Environment (keep example, ignore actual)
 .env
+!.env.example
 
 # Downloads (keep directory but ignore contents)
 downloads/*
