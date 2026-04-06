@@ -127,7 +127,9 @@ async def root():
         "endpoints": {
             "/consulta/{placa}": "Query vehicle by plate number and get image",
             "/consulta/{placa}/json": "Query vehicle and get JSON with image path",
-            "/consulta/{placa}/full": "Query vehicle and get complete metadata (sedes, alerts, etc.)",
+            "/consulta/{placa}/full": "Query vehicle and get complete metadata + OCR data",
+            "/ocr/{filename}": "Run OCR on an existing image",
+            "/ocr/{filename}/debug": "Debug OCR extraction with all methods",
             "/images/{filename}": "Retrieve a previously captured image",
             "/health": "Health check endpoint",
             "/docs": "Interactive API documentation",
@@ -346,6 +348,88 @@ async def delete_image(filename: str):
         raise HTTPException(status_code=403, detail="Access denied")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ocr/{filename}")
+async def ocr_image(filename: str):
+    """
+    Run OCR extraction on an existing image.
+    
+    Args:
+        filename: Name of the image file in the downloads directory
+        
+    Returns:
+        JSON with extracted vehicle data
+    """
+    filepath = DOWNLOADS_DIR / filename
+    
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Image not found")
+    
+    # Security check
+    try:
+        filepath.resolve().relative_to(DOWNLOADS_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    try:
+        from ocr import extract_vehicle_data
+        
+        result = extract_vehicle_data(str(filepath))
+        return JSONResponse(result)
+        
+    except ImportError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"OCR module not available. Install dependencies: {e}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"OCR error: {str(e)}"
+        )
+
+
+@app.get("/ocr/{filename}/debug")
+async def ocr_image_debug(filename: str):
+    """
+    Debug OCR extraction - shows results from all preprocessing methods.
+    
+    Useful for troubleshooting OCR issues and comparing different approaches.
+    
+    Args:
+        filename: Name of the image file in the downloads directory
+        
+    Returns:
+        JSON with raw OCR output from multiple methods
+    """
+    filepath = DOWNLOADS_DIR / filename
+    
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Image not found")
+    
+    # Security check
+    try:
+        filepath.resolve().relative_to(DOWNLOADS_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    try:
+        from ocr import extract_vehicle_data_debug
+        
+        result = extract_vehicle_data_debug(str(filepath))
+        return JSONResponse(result)
+        
+    except ImportError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"OCR module not available. Install dependencies: {e}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"OCR error: {str(e)}"
+        )
 
 
 def main():

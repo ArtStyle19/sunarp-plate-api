@@ -59,6 +59,68 @@ class SedeInfo:
 
 
 @dataclass
+class VehicleOCRData:
+    """Extracted vehicle data from OCR."""
+    placa: Optional[str] = None
+    serie: Optional[str] = None
+    vin: Optional[str] = None
+    motor: Optional[str] = None
+    color: Optional[str] = None
+    marca: Optional[str] = None
+    modelo: Optional[str] = None
+    placa_vigente: Optional[str] = None
+    placa_anterior: Optional[str] = None
+    estado: Optional[str] = None
+    anotaciones: Optional[str] = None
+    sede: Optional[str] = None
+    anio_modelo: Optional[str] = None
+    propietario: Optional[str] = None
+    raw_text: Optional[str] = None
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "VehicleOCRData":
+        return cls(
+            placa=data.get("placa"),
+            serie=data.get("serie"),
+            vin=data.get("vin"),
+            motor=data.get("motor"),
+            color=data.get("color"),
+            marca=data.get("marca"),
+            modelo=data.get("modelo"),
+            placa_vigente=data.get("placa_vigente"),
+            placa_anterior=data.get("placa_anterior"),
+            estado=data.get("estado"),
+            anotaciones=data.get("anotaciones"),
+            sede=data.get("sede"),
+            anio_modelo=data.get("anio_modelo"),
+            propietario=data.get("propietario"),
+            raw_text=data.get("raw_text"),
+        )
+    
+    def to_dict(self, include_raw: bool = False) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        result = {
+            "placa": self.placa,
+            "serie": self.serie,
+            "vin": self.vin,
+            "motor": self.motor,
+            "color": self.color,
+            "marca": self.marca,
+            "modelo": self.modelo,
+            "placa_vigente": self.placa_vigente,
+            "placa_anterior": self.placa_anterior,
+            "estado": self.estado,
+            "anotaciones": self.anotaciones,
+            "sede": self.sede,
+            "anio_modelo": self.anio_modelo,
+            "propietario": self.propietario,
+        }
+        if include_raw:
+            result["raw_text"] = self.raw_text
+        return result
+
+
+@dataclass
 class ConsultaResult:
     """Result of a SUNARP vehicle consultation."""
     success: bool = False
@@ -72,10 +134,13 @@ class ConsultaResult:
     sedes: List[SedeInfo] = field(default_factory=list)
     raw_response: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    # OCR extracted data
+    ocr_data: Optional[VehicleOCRData] = None
+    ocr_error: Optional[str] = None
     
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, include_ocr_raw: bool = False) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
-        return {
+        result = {
             "success": self.success,
             "image_path": self.image_path,
             "placa": self.placa,
@@ -98,6 +163,17 @@ class ConsultaResult:
             ],
             "error": self.error,
         }
+        
+        # Add OCR data if available
+        if self.ocr_data:
+            result["vehiculo"] = self.ocr_data.to_dict(include_raw=include_ocr_raw)
+        else:
+            result["vehiculo"] = None
+        
+        if self.ocr_error:
+            result["ocr_error"] = self.ocr_error
+        
+        return result
 
 
 class SunarpScraper:
@@ -922,6 +998,27 @@ class SunarpScraper:
             result.success = True
             result.image_path = str(filepath)
             print(f"[INFO] Image saved to: {filepath}")
+            
+            # Perform OCR extraction
+            try:
+                from ocr import extract_vehicle_data
+                
+                print(f"[INFO] Running OCR on image...")
+                ocr_result = extract_vehicle_data(str(filepath))
+                
+                if ocr_result["success"] and ocr_result["data"]:
+                    result.ocr_data = VehicleOCRData.from_dict(ocr_result["data"])
+                    print(f"[INFO] OCR extraction successful")
+                else:
+                    result.ocr_error = ocr_result.get("error", "OCR extraction failed")
+                    print(f"[WARN] OCR extraction failed: {result.ocr_error}")
+                    
+            except ImportError as e:
+                result.ocr_error = f"OCR module not available: {e}"
+                print(f"[WARN] OCR module import error: {e}")
+            except Exception as e:
+                result.ocr_error = f"OCR error: {str(e)}"
+                print(f"[WARN] OCR error: {e}")
             
         except Exception as e:
             result.success = False

@@ -1,0 +1,1 @@
+{"cod":1,"mensaje":"Placa encontrada satisfactoriamente","mensajeTxt":"Consulta Vehicular","icon":"success","model":{"imagen":"","msgAlertaRobo":"","sedes":[{"prefijo":"OR0101","regPubId":"01","oficRegId":"01","nombre":"LIMA","fgBaja":"0","placa":"ABC123 ","numPartida":"50274860"}]}}

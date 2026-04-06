@@ -1,0 +1,28 @@
+{
+  "success": true,
+  "image_path": "/home/vicari/Downloads/PROJECTS/sunarp/downloads/sunarp_V0Z956_20260406_012759.png",
+  "placa": "V0Z956",
+  "cod": 1,
+  "mensaje": "Placa encontrada satisfactoriamente",
+  "mensaje_txt": "Consulta Vehicular",
+  "icon": "success",
+  "alerta_robo": "",
+  "sedes": [],
+  "error": null,
+  "vehiculo": {
+    "placa": "VOZ956",
+    "serie": "LAGIAAA2XFB515310",
+    "vin": "LASIAAA2XFB515310",
+    "motor": "]E493ZQ4A30052226",
+    "color": "BLANCO",
+    "marca": "SHINE LAND",
+    "modelo": "XMQ6520E4",
+    "placa_vigente": "VOZ956",
+    "placa_anterior": "NINGUNA",
+    "estado": "EN CIRCULACION",
+    "anotaciones": "NINGUNA",
+    "sede": "AREQUIPA",
+    "anio_modelo": "2015",
+    "propietario": "CASTILLO CONDORI, MARIA JESUS"
+  }
+}
