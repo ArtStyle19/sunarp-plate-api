@@ -149,7 +149,7 @@ async def consultar_vehiculo(
     placa: str,
     background_tasks: BackgroundTasks,
     download: bool = True,
-    slow: bool = Query(False, description="Use longer timeouts for slow internet connections"),
+    slow: Optional[bool] = Query(None, description="Use longer timeouts for slow internet connections"),
 ):
     """
     Query vehicle information from SUNARP by plate number.
@@ -173,13 +173,25 @@ async def consultar_vehiculo(
     # Use lock to ensure only one request at a time
     async with scraper_lock:
         try:
-            print(f"\n[API] Starting consultation for plate: {placa}" + (" [slow mode]" if slow else ""))
+            effective_slow = SLOW_MODE if slow is None else slow
+            print(f"\n[API] Starting consultation for plate: {placa}" + (" [slow mode]" if effective_slow else ""))
             
             # Get scraper and perform consultation
-            scraper_instance = get_scraper(slow_mode=slow)
+            scraper_instance = get_scraper(slow_mode=effective_slow)
             result: ConsultaResult = await scraper_instance.consultar_placa(placa)
             
             if not result.success:
+                error_text = (result.error or "").lower()
+                if "captcha no resuelto" in error_text:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=result.error
+                    )
+                if "timeout waiting for api response" in error_text:
+                    raise HTTPException(
+                        status_code=504,
+                        detail="Timeout waiting for SUNARP API response. Intenta con ?slow=true"
+                    )
                 raise HTTPException(
                     status_code=404 if result.cod == 0 else 500,
                     detail=result.error or result.mensaje or "Consultation failed"
@@ -236,7 +248,7 @@ async def consultar_vehiculo(
 async def consultar_vehiculo_json(
     placa: str,
     background_tasks: BackgroundTasks,
-    slow: bool = Query(False, description="Use longer timeouts for slow internet connections"),
+    slow: Optional[bool] = Query(None, description="Use longer timeouts for slow internet connections"),
 ):
     """
     Query vehicle and return JSON response with file path instead of the image.
@@ -248,7 +260,7 @@ async def consultar_vehiculo_json(
 async def consultar_vehiculo_full(
     placa: str,
     background_tasks: BackgroundTasks,
-    slow: bool = Query(False, description="Use longer timeouts for slow internet connections"),
+    slow: Optional[bool] = Query(None, description="Use longer timeouts for slow internet connections"),
 ):
     """
     Query vehicle and return complete metadata including sedes, alerts, and image path.
@@ -277,10 +289,11 @@ async def consultar_vehiculo_full(
     # Use lock to ensure only one request at a time
     async with scraper_lock:
         try:
-            print(f"\n[API] Starting full consultation for plate: {placa}" + (" [slow mode]" if slow else ""))
+            effective_slow = SLOW_MODE if slow is None else slow
+            print(f"\n[API] Starting full consultation for plate: {placa}" + (" [slow mode]" if effective_slow else ""))
             
             # Get scraper and perform consultation
-            scraper_instance = get_scraper(slow_mode=slow)
+            scraper_instance = get_scraper(slow_mode=effective_slow)
             result: ConsultaResult = await scraper_instance.consultar_placa(placa)
             
             # Schedule cleanup of old images

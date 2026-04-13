@@ -358,6 +358,12 @@ class SunarpScraper:
                     self._wait_for_api_response(tab),
                     timeout=result_timeout
                 )
+            except RuntimeError as e:
+                return ConsultaResult(
+                    success=False,
+                    placa=placa,
+                    error=str(e)
+                )
             except asyncio.TimeoutError:
                 return ConsultaResult(
                     success=False,
@@ -720,13 +726,62 @@ class SunarpScraper:
             print(f"[DEBUG] Error in response callback: {e}")
     
     async def _wait_for_api_response(self, tab):
-        """Wait for the API response and retrieve its body."""
-        # Wait for response received event
-        await self._response_event.wait()
-        
+        """Wait for the API response and retrieve its body.
+
+        Also monitors for the common SUNARP captcha error so we can fail fast
+        instead of waiting for the full API timeout.
+        """
+
+        def get_script_value(result):
+            if isinstance(result, dict):
+                if "result" in result:
+                    inner = result["result"]
+                    if isinstance(inner, dict) and "result" in inner:
+                        inner = inner["result"]
+                    if isinstance(inner, dict) and "value" in inner:
+                        return inner["value"]
+                    return inner
+            return result
+
+        captcha_error_hits = 0
+        captcha_error_limit = 20 if self.slow_mode else 12
+
+        while not self._response_event.is_set():
+            try:
+                check_result = await tab.execute_script("""
+                    const bodyText = (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase();
+                    const tokenInput = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
+                    const tokenLength = tokenInput && tokenInput.value ? tokenInput.value.length : 0;
+                    const hasToken = tokenLength > 20;
+                    const captchaError = bodyText.includes('resuelva el captcha') || bodyText.includes('captcha no resuelto');
+                    return JSON.stringify({ hasToken, captchaError, tokenLength });
+                """)
+
+                status = get_script_value(check_result)
+                if isinstance(status, str):
+                    status = json.loads(status)
+
+                if status.get("captchaError") and not status.get("hasToken"):
+                    captcha_error_hits += 1
+                else:
+                    captcha_error_hits = 0
+
+                if captcha_error_hits >= captcha_error_limit:
+                    msg = "Captcha no resuelto. Intenta nuevamente."
+                    if not self.slow_mode:
+                        msg += " Sugerencia: usa ?slow=true para conexiones lentas."
+                    raise RuntimeError(msg)
+
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+
+            await asyncio.sleep(0.5)
+
         # Small delay to ensure response body is available
-        await asyncio.sleep(1)
-        
+        await asyncio.sleep(0.8)
+
         # Get the response body
         if self._pending_request_id:
             try:
@@ -829,22 +884,25 @@ class SunarpScraper:
                     return inner
             return result
         
-        # Fast captcha detection with shorter polling
-        max_captcha_wait = 30 if self.slow_mode else 15  # Reduced from 30s
-        poll_interval = 0.2  # Faster polling (was 0.5s)
+        # More conservative captcha detection for unstable internet
+        max_captcha_wait = 60 if self.slow_mode else 35
+        poll_interval = 0.4
         
         print("[INFO] Waiting for Turnstile captcha...")
         
         captcha_completed = False
         start_time = asyncio.get_event_loop().time()
+        saw_turnstile = False
+        no_turnstile_enabled_streak = 0
         
         while (asyncio.get_event_loop().time() - start_time) < max_captcha_wait:
             try:
-                # Combined check: captcha token OR button already enabled
+                # Combined check: token + button state + Turnstile iframe
                 check_result = await tab.execute_script("""
                     // Check for Turnstile response token
-                    const turnstileInput = document.querySelector('input[name="cf-turnstile-response"]');
-                    const hasToken = turnstileInput && turnstileInput.value && turnstileInput.value.length > 10;
+                    const turnstileInput = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
+                    const tokenLength = turnstileInput && turnstileInput.value ? turnstileInput.value.length : 0;
+                    const hasToken = tokenLength > 20;
                     
                     // Check if button is already enabled
                     const btn = document.querySelector('button.btn-sunarp-green');
@@ -853,12 +911,17 @@ class SunarpScraper:
                     // Check if turnstile iframe exists (still loading)
                     const turnstileFrame = document.querySelector('iframe[src*="turnstile"]');
                     const hasTurnstile = !!turnstileFrame;
+
+                    // Detect visible captcha error text
+                    const bodyText = (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase();
+                    const captchaError = bodyText.includes('resuelva el captcha') || bodyText.includes('captcha no resuelto');
                     
                     return JSON.stringify({
                         hasToken: hasToken,
-                        tokenLength: hasToken ? turnstileInput.value.length : 0,
+                        tokenLength: tokenLength,
                         btnEnabled: btnEnabled,
-                        hasTurnstile: hasTurnstile
+                        hasTurnstile: hasTurnstile,
+                        captchaError: captchaError
                     });
                 """)
                 
@@ -866,22 +929,38 @@ class SunarpScraper:
                 if isinstance(status, str):
                     import json
                     status = json.loads(status)
+
+                if status.get('hasTurnstile'):
+                    saw_turnstile = True
+                    no_turnstile_enabled_streak = 0
                 
-                # If we have token OR button is enabled, we're good
-                if status.get('hasToken') or status.get('btnEnabled'):
+                # Best signal: explicit token present
+                if status.get('hasToken'):
                     elapsed = asyncio.get_event_loop().time() - start_time
-                    if status.get('hasToken'):
-                        print(f"[INFO] Captcha completed in {elapsed:.1f}s (token: {status.get('tokenLength')} chars)")
-                    else:
-                        print(f"[INFO] Button enabled in {elapsed:.1f}s")
+                    print(f"[INFO] Captcha completed in {elapsed:.1f}s (token: {status.get('tokenLength')} chars)")
                     captcha_completed = True
                     break
                 
-                # If no turnstile at all, proceed
-                if not status.get('hasTurnstile'):
-                    print("[INFO] No Turnstile detected, proceeding...")
-                    captcha_completed = True
-                    break
+                # Fallback for cases where Turnstile is not required/rendered
+                if not status.get('hasTurnstile') and status.get('btnEnabled'):
+                    no_turnstile_enabled_streak += 1
+                    elapsed = asyncio.get_event_loop().time() - start_time
+                    # If we never saw Turnstile, wait longer to avoid early click on slow pages
+                    if not saw_turnstile and no_turnstile_enabled_streak >= 15 and elapsed >= 6:
+                        print("[INFO] Turnstile not detected after stable wait, proceeding...")
+                        captcha_completed = True
+                        break
+                    # If Turnstile appeared before and is now gone, allow sooner
+                    if saw_turnstile and no_turnstile_enabled_streak >= 4:
+                        print("[INFO] Turnstile disappeared and button enabled, proceeding...")
+                        captcha_completed = True
+                        break
+                else:
+                    no_turnstile_enabled_streak = 0
+
+                # If we already see captcha error, keep waiting for token instead of clicking too early
+                if status.get('captchaError'):
+                    pass
                     
             except Exception as e:
                 pass  # Silent retry
@@ -889,12 +968,12 @@ class SunarpScraper:
             await asyncio.sleep(poll_interval)
         
         if not captcha_completed:
-            print("[WARN] Captcha wait timed out, attempting click anyway...")
+            print("[WARN] Captcha wait timed out, attempting guarded click...")
         
         # Minimal delay before clicking
         await asyncio.sleep(0.3)
         
-        # Click the button
+        # Click button with guarded retries (for slow network/token propagation)
         print("[INFO] Clicking search button...")
         
         result = await tab.execute_script("""
@@ -911,6 +990,38 @@ class SunarpScraper:
         
         if clicked == 'clicked':
             print("[INFO] Search button clicked")
+            await asyncio.sleep(1.2)
+
+            # If captcha error appears immediately, retry a few times waiting for token propagation
+            for attempt in range(1, 4):
+                try:
+                    post_click = await tab.execute_script("""
+                        const bodyText = (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase();
+                        const tokenInput = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
+                        const tokenLength = tokenInput && tokenInput.value ? tokenInput.value.length : 0;
+                        const hasToken = tokenLength > 20;
+                        const captchaError = bodyText.includes('resuelva el captcha') || bodyText.includes('captcha no resuelto');
+                        return JSON.stringify({ hasToken, captchaError, tokenLength });
+                    """)
+                    post_click = get_script_value(post_click)
+                    if isinstance(post_click, str):
+                        post_click = json.loads(post_click)
+
+                    if not post_click.get('captchaError'):
+                        return
+
+                    if post_click.get('hasToken'):
+                        print(f"[INFO] Captcha token available after click, retrying submit (attempt {attempt})")
+                        await asyncio.sleep(0.9)
+                        await tab.execute_script("""
+                            const btn = document.querySelector('button.btn-sunarp-green, button.ant-btn-primary');
+                            if (btn) { btn.disabled = false; btn.removeAttribute('disabled'); btn.click(); }
+                        """)
+                        await asyncio.sleep(1.0)
+                    else:
+                        await asyncio.sleep(1.0)
+                except Exception:
+                    await asyncio.sleep(0.8)
             return
         
         # Fallback: try ant-btn-primary
