@@ -137,6 +137,8 @@ class ConsultaResult:
     # OCR extracted data
     ocr_data: Optional[VehicleOCRData] = None
     ocr_error: Optional[str] = None
+    attempts: int = 0
+    state_timeline: List[Dict[str, Any]] = field(default_factory=list)
     
     def to_dict(self, include_ocr_raw: bool = False) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -162,6 +164,7 @@ class ConsultaResult:
                 for s in self.sedes
             ],
             "error": self.error,
+            "attempts": self.attempts,
         }
         
         # Add OCR data if available
@@ -172,6 +175,9 @@ class ConsultaResult:
         
         if self.ocr_error:
             result["ocr_error"] = self.ocr_error
+
+        if self.state_timeline:
+            result["state_timeline"] = self.state_timeline
         
         return result
 
@@ -196,6 +202,244 @@ class SunarpScraper:
         self._response_event = asyncio.Event()
         self._pending_request_id: Optional[str] = None
         self._tab = None
+        self._state_timeline: List[Dict[str, Any]] = []
+
+    def _record_state(self, phase: str, **details: Any):
+        """Record internal state transitions for debugging and observability."""
+        entry = {
+            "ts": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+            "phase": phase,
+        }
+        if details:
+            entry["details"] = details
+        self._state_timeline.append(entry)
+        # Keep a bounded timeline to avoid unbounded growth
+        if len(self._state_timeline) > 200:
+            self._state_timeline = self._state_timeline[-200:]
+
+    def _extract_script_value(self, result: Any) -> Any:
+        """Extract the actual value from pydoll execute_script responses."""
+        if isinstance(result, dict):
+            if "result" in result:
+                inner = result["result"]
+                if isinstance(inner, dict) and "result" in inner:
+                    inner = inner["result"]
+                if isinstance(inner, dict) and "value" in inner:
+                    return inner["value"]
+                return inner
+        return result
+
+    async def _run_json_script(self, tab, script: str, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Execute script and parse JSON result safely."""
+        try:
+            raw = await tab.execute_script(script)
+            value = self._extract_script_value(raw)
+            if isinstance(value, str):
+                return json.loads(value)
+            if isinstance(value, dict):
+                return value
+        except Exception:
+            pass
+        return default or {}
+
+    async def _inject_runtime_watchers(self, tab):
+        """Inject runtime observers for dynamic, response-driven flow control."""
+        watcher_script = """
+        (function() {
+            const API_HOST = 'api-gateway.sunarp.gob.pe';
+            const API_PATH = 'getDatosVehiculo';
+
+            if (!window.__sunarpRuntime) {
+                window.__sunarpRuntime = {
+                    initialized: false,
+                    apiRequestCount: 0,
+                    apiRequestInFlight: false,
+                    apiLastRequestAt: 0,
+                    apiLastResponseAt: 0,
+                    apiLastError: '',
+                    submitClicks: 0,
+                    lastSubmitAt: 0,
+                    events: []
+                };
+            }
+
+            const runtime = window.__sunarpRuntime;
+
+            const pushEvent = (type, data) => {
+                try {
+                    runtime.events.push({
+                        type,
+                        at: Date.now(),
+                        ...(data || {})
+                    });
+                    if (runtime.events.length > 150) {
+                        runtime.events = runtime.events.slice(-150);
+                    }
+                } catch (e) {}
+            };
+
+            runtime.pushEvent = pushEvent;
+
+            if (!runtime.fetchPatched && window.fetch) {
+                const originalFetch = window.fetch;
+                window.fetch = function() {
+                    const input = arguments[0];
+                    const url = (typeof input === 'string') ? input : ((input && input.url) ? input.url : '');
+                    const isApi = url.includes(API_HOST) && url.includes(API_PATH);
+
+                    if (isApi) {
+                        runtime.apiRequestCount += 1;
+                        runtime.apiRequestInFlight = true;
+                        runtime.apiLastRequestAt = Date.now();
+                        pushEvent('api_fetch_request', { url });
+                    }
+
+                    return originalFetch.apply(this, arguments)
+                        .then((response) => {
+                            if (isApi) {
+                                runtime.apiRequestInFlight = false;
+                                runtime.apiLastResponseAt = Date.now();
+                                pushEvent('api_fetch_response', { status: response.status });
+                            }
+                            return response;
+                        })
+                        .catch((error) => {
+                            if (isApi) {
+                                runtime.apiRequestInFlight = false;
+                                runtime.apiLastError = String(error);
+                                pushEvent('api_fetch_error', { error: String(error) });
+                            }
+                            throw error;
+                        });
+                };
+                runtime.fetchPatched = true;
+            }
+
+            if (!runtime.xhrPatched && window.XMLHttpRequest) {
+                const originalOpen = XMLHttpRequest.prototype.open;
+                const originalSend = XMLHttpRequest.prototype.send;
+
+                XMLHttpRequest.prototype.open = function(method, url) {
+                    this.__sunarpUrl = url || '';
+                    this.__sunarpMethod = method || '';
+                    return originalOpen.apply(this, arguments);
+                };
+
+                XMLHttpRequest.prototype.send = function() {
+                    const url = this.__sunarpUrl || '';
+                    const isApi = url.includes(API_HOST) && url.includes(API_PATH);
+
+                    if (isApi) {
+                        runtime.apiRequestCount += 1;
+                        runtime.apiRequestInFlight = true;
+                        runtime.apiLastRequestAt = Date.now();
+                        pushEvent('api_xhr_request', { url, method: this.__sunarpMethod || '' });
+
+                        this.addEventListener('loadend', function() {
+                            runtime.apiRequestInFlight = false;
+                            runtime.apiLastResponseAt = Date.now();
+                            pushEvent('api_xhr_loadend', { status: this.status });
+                        });
+
+                        this.addEventListener('error', function() {
+                            runtime.apiRequestInFlight = false;
+                            runtime.apiLastError = 'xhr_error';
+                            pushEvent('api_xhr_error', {});
+                        });
+
+                        this.addEventListener('abort', function() {
+                            runtime.apiRequestInFlight = false;
+                            runtime.apiLastError = 'xhr_abort';
+                            pushEvent('api_xhr_abort', {});
+                        });
+                    }
+
+                    return originalSend.apply(this, arguments);
+                };
+
+                runtime.xhrPatched = true;
+            }
+
+            runtime.initialized = true;
+            return JSON.stringify({ ok: true, initialized: runtime.initialized });
+        })();
+        """
+        await self._run_json_script(tab, watcher_script, default={"ok": False})
+
+    async def _get_runtime_state(self, tab) -> Dict[str, Any]:
+        """Read dynamic page/runtime state used by the state machine."""
+        state_script = """
+        (function() {
+            const plateInput = document.querySelector("input#placa, input[name='placa'], input[formcontrolname='placa'], input[placeholder*='ABC'], input[type='text']");
+            const searchBtn = document.querySelector('button.btn-sunarp-green, button.ant-btn-primary');
+            const turnstileFrame = document.querySelector('iframe[src*="turnstile"]');
+            const tokenInput = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
+
+            const tokenLength = tokenInput && tokenInput.value ? tokenInput.value.length : 0;
+            const hasToken = tokenLength > 20;
+
+            const bodyText = (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase();
+            const captchaError = bodyText.includes('resuelva el captcha') || bodyText.includes('captcha no resuelto');
+
+            const runtime = window.__sunarpRuntime || {};
+            const events = Array.isArray(runtime.events) ? runtime.events : [];
+            const lastEvent = events.length ? events[events.length - 1] : null;
+
+            return JSON.stringify({
+                hasPlateInput: !!plateInput,
+                plateValue: plateInput && plateInput.value ? plateInput.value : '',
+                buttonFound: !!searchBtn,
+                buttonEnabled: !!searchBtn && !searchBtn.disabled,
+                hasTurnstile: !!turnstileFrame,
+                hasToken,
+                tokenLength,
+                captchaError,
+                apiRequestCount: runtime.apiRequestCount || 0,
+                apiRequestInFlight: !!runtime.apiRequestInFlight,
+                apiLastRequestAt: runtime.apiLastRequestAt || 0,
+                apiLastResponseAt: runtime.apiLastResponseAt || 0,
+                apiLastError: runtime.apiLastError || '',
+                submitClicks: runtime.submitClicks || 0,
+                lastSubmitAt: runtime.lastSubmitAt || 0,
+                eventCount: events.length,
+                lastEventType: lastEvent ? (lastEvent.type || '') : ''
+            });
+        })();
+        """
+
+        return await self._run_json_script(
+            tab,
+            state_script,
+            default={
+                "hasPlateInput": False,
+                "plateValue": "",
+                "buttonFound": False,
+                "buttonEnabled": False,
+                "hasTurnstile": False,
+                "hasToken": False,
+                "tokenLength": 0,
+                "captchaError": False,
+                "apiRequestCount": 0,
+                "apiRequestInFlight": False,
+                "apiLastRequestAt": 0,
+                "apiLastResponseAt": 0,
+                "apiLastError": "",
+                "submitClicks": 0,
+                "lastSubmitAt": 0,
+                "eventCount": 0,
+                "lastEventType": "",
+            },
+        )
+
+    def _build_failure_result(self, placa: str, error: str, attempts: int = 0) -> ConsultaResult:
+        """Build a standardized failed result with state timeline attached."""
+        return ConsultaResult(
+            success=False,
+            placa=placa,
+            error=error,
+            attempts=attempts,
+            state_timeline=list(self._state_timeline),
+        )
     
     def _get_browser_options(self) -> ChromiumOptions:
         """Configure Chrome options to appear as genuine Google Chrome."""
@@ -281,6 +525,7 @@ class SunarpScraper:
             # Re-inject anti-detection on each navigation
             if self._tab:
                 await self._inject_anti_detection(self._tab)
+                await self._inject_runtime_watchers(self._tab)
         except Exception as e:
             print(f"[DEBUG] Frame navigation callback error: {e}")
     
@@ -295,6 +540,8 @@ class SunarpScraper:
             ConsultaResult with image path and metadata.
         """
         placa = placa.strip().upper()
+        self._state_timeline = []
+        self._record_state("consulta_start", placa=placa, slow_mode=self.slow_mode, headless=self.headless)
         self._api_response = None
         self._response_event.clear()
         self._pending_request_id = None
@@ -305,9 +552,8 @@ class SunarpScraper:
             tab = await browser.start()
             self._tab = tab
             
-            # Adaptive delays based on slow_mode
-            nav_delay = 4 if self.slow_mode else 2      # After navigation
-            result_timeout = RESULT_TIMEOUT * 1.5 if self.slow_mode else RESULT_TIMEOUT
+            # Adaptive watchdog timeout (control flow remains state-driven)
+            result_timeout = RESULT_TIMEOUT * (1.8 if self.slow_mode else 1.2)
             
             # Enable page events to track navigation
             print(f"[INFO] Enabling page events...")
@@ -320,6 +566,7 @@ class SunarpScraper:
             # Inject anti-detection BEFORE any navigation
             print(f"[INFO] Injecting anti-detection scripts...")
             await self._inject_anti_detection(tab)
+            await self._inject_runtime_watchers(tab)
             
             # Enable network events to intercept API responses
             print(f"[INFO] Enabling network interception...")
@@ -331,56 +578,99 @@ class SunarpScraper:
             # Navigate to the base domain first (helps with session/cookies)
             print(f"[INFO] Navigating to base domain...")
             await tab.go_to("https://consultavehicular.sunarp.gob.pe/")
-            await asyncio.sleep(nav_delay)
+            self._record_state("navigated_base_domain")
             
             print(f"[INFO] Waiting for page elements to load...")
-            cf_timeout = CLOUDFLARE_TIMEOUT * 1.5 if self.slow_mode else CLOUDFLARE_TIMEOUT
-            await self._wait_for_cloudflare(tab, timeout=int(cf_timeout))
+            cf_timeout = CLOUDFLARE_TIMEOUT * (1.5 if self.slow_mode else 1.0)
+            try:
+                await self._wait_for_cloudflare(tab, timeout=int(cf_timeout))
+            except TimeoutError:
+                return self._build_failure_result(
+                    placa,
+                    "Cloudflare/Turnstile no completado en tiempo esperado",
+                )
             
             print(f"[INFO] Filling plate number: {placa}")
-            await self._fill_plate_input(tab, placa)
-            
-            # Small delay after typing to let Angular process the input
-            await asyncio.sleep(0.5)
-            
-            # Reset the response state before clicking (ignore any previous API calls)
-            self._api_response = None
-            self._response_event.clear()
-            self._pending_request_id = None
-            
-            print(f"[INFO] Clicking search button...")
-            await self._click_search_button(tab)
-            
-            print(f"[INFO] Waiting for API response...")
-            # Wait for the API response to be intercepted
-            try:
-                await asyncio.wait_for(
-                    self._wait_for_api_response(tab),
-                    timeout=result_timeout
+            fill_ok = await self._fill_plate_input(tab, placa)
+            if not fill_ok:
+                return self._build_failure_result(placa, "No se pudo completar el campo placa")
+
+            plate_ok = await self._wait_for_plate_value(tab, placa, timeout=25)
+            if not plate_ok:
+                return self._build_failure_result(placa, "La placa no quedó registrada en el formulario")
+
+            max_submit_attempts = 3 if self.slow_mode else 2
+            attempts_used = 0
+            last_error = "No API response received"
+
+            for attempt in range(1, max_submit_attempts + 1):
+                attempts_used = attempt
+                self._record_state("submit_attempt_start", attempt=attempt)
+
+                # Reset response tracking for this attempt
+                self._api_response = None
+                self._response_event.clear()
+                self._pending_request_id = None
+
+                gate_state = await self._wait_for_submission_gate(tab, attempt=attempt)
+                if not gate_state.get("ready"):
+                    last_error = gate_state.get("error", "Captcha no resuelto")
+                    self._record_state("submit_gate_failed", attempt=attempt, error=last_error)
+                    if attempt < max_submit_attempts:
+                        continue
+                    return self._build_failure_result(placa, last_error, attempts=attempts_used)
+
+                self._record_state(
+                    "submit_gate_ready",
+                    attempt=attempt,
+                    gate_reason=gate_state.get("gate_reason", "unknown"),
+                    has_token=gate_state.get("hasToken", False),
+                    has_turnstile=gate_state.get("hasTurnstile", False),
                 )
-            except RuntimeError as e:
-                return ConsultaResult(
-                    success=False,
-                    placa=placa,
-                    error=str(e)
+
+                clicked = await self._click_search_button(tab)
+                if not clicked:
+                    last_error = "No se pudo hacer click en el botón de búsqueda"
+                    self._record_state("submit_click_failed", attempt=attempt)
+                    if attempt < max_submit_attempts:
+                        continue
+                    return self._build_failure_result(placa, last_error, attempts=attempts_used)
+
+                print(f"[INFO] Waiting for API response (attempt {attempt}/{max_submit_attempts})...")
+                outcome = await self._wait_for_api_response(
+                    tab,
+                    result_timeout=result_timeout,
+                    attempt=attempt,
+                    baseline_api_count=int(gate_state.get("apiRequestCount", 0)),
+                    baseline_submit_clicks=int(gate_state.get("submitClicks", 0)),
                 )
-            except asyncio.TimeoutError:
-                return ConsultaResult(
-                    success=False,
-                    placa=placa,
-                    error="Timeout waiting for API response"
+
+                if outcome.get("status") == "response_ready" and self._api_response:
+                    self._record_state("submit_attempt_success", attempt=attempt)
+                    break
+
+                last_error = outcome.get("error", "No API response received")
+                self._record_state(
+                    "submit_attempt_failed",
+                    attempt=attempt,
+                    status=outcome.get("status", "unknown"),
+                    error=last_error,
                 )
-            
-            # Process the intercepted response
-            if self._api_response:
-                print(f"[INFO] Processing API response...")
-                return await self._process_api_response(self._api_response, placa)
-            else:
-                return ConsultaResult(
-                    success=False,
-                    placa=placa,
-                    error="No API response received"
-                )
+
+                if attempt < max_submit_attempts:
+                    # Re-ensure plate value before retrying
+                    await self._wait_for_plate_value(tab, placa, timeout=10)
+                    continue
+
+            # Process final outcome
+            if not self._api_response:
+                return self._build_failure_result(placa, last_error, attempts=attempts_used)
+
+            print(f"[INFO] Processing API response...")
+            processed = await self._process_api_response(self._api_response, placa)
+            processed.attempts = attempts_used
+            processed.state_timeline = list(self._state_timeline)
+            return processed
     
     async def _inject_anti_detection(self, tab):
         """Inject comprehensive JavaScript to make Chromium appear as genuine Chrome."""
@@ -725,343 +1015,343 @@ class SunarpScraper:
         except Exception as e:
             print(f"[DEBUG] Error in response callback: {e}")
     
-    async def _wait_for_api_response(self, tab):
-        """Wait for the API response and retrieve its body.
+    async def _wait_for_api_response(
+        self,
+        tab,
+        result_timeout: float,
+        attempt: int,
+        baseline_api_count: int,
+        baseline_submit_clicks: int,
+    ) -> Dict[str, Any]:
+        """Wait dynamically for API response or deterministic failure state."""
+        loop = asyncio.get_event_loop()
+        start_time = loop.time()
+        poll_interval = 0.45 if self.slow_mode else 0.25
 
-        Also monitors for the common SUNARP captcha error so we can fail fast
-        instead of waiting for the full API timeout.
-        """
-
-        def get_script_value(result):
-            if isinstance(result, dict):
-                if "result" in result:
-                    inner = result["result"]
-                    if isinstance(inner, dict) and "result" in inner:
-                        inner = inner["result"]
-                    if isinstance(inner, dict) and "value" in inner:
-                        return inner["value"]
-                    return inner
-            return result
-
+        request_seen = False
         captcha_error_hits = 0
-        captcha_error_limit = 20 if self.slow_mode else 12
+        no_request_hits = 0
 
-        while not self._response_event.is_set():
-            try:
-                check_result = await tab.execute_script("""
-                    const bodyText = (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase();
-                    const tokenInput = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
-                    const tokenLength = tokenInput && tokenInput.value ? tokenInput.value.length : 0;
-                    const hasToken = tokenLength > 20;
-                    const captchaError = bodyText.includes('resuelva el captcha') || bodyText.includes('captcha no resuelto');
-                    return JSON.stringify({ hasToken, captchaError, tokenLength });
-                """)
+        captcha_error_limit = 40 if self.slow_mode else 22
+        no_request_limit = 40 if self.slow_mode else 24
 
-                status = get_script_value(check_result)
-                if isinstance(status, str):
-                    status = json.loads(status)
+        while (loop.time() - start_time) < result_timeout:
+            # Fast path: network callback has intercepted API response
+            if self._response_event.is_set() and self._pending_request_id:
+                for body_try in range(4):
+                    try:
+                        body = await tab.get_network_response_body(self._pending_request_id)
+                        self._api_response = json.loads(body)
+                        self._record_state(
+                            "api_response_captured",
+                            attempt=attempt,
+                            request_id=self._pending_request_id,
+                            body_try=body_try + 1,
+                        )
+                        print(f"[INFO] API response body retrieved successfully")
+                        return {"status": "response_ready"}
+                    except Exception as e:
+                        if body_try == 3:
+                            self._record_state(
+                                "api_response_body_failed",
+                                attempt=attempt,
+                                error=str(e),
+                            )
+                            break
+                        await asyncio.sleep(poll_interval)
 
-                if status.get("captchaError") and not status.get("hasToken"):
+            state = await self._get_runtime_state(tab)
+            api_count = int(state.get("apiRequestCount", 0))
+            submit_clicks = int(state.get("submitClicks", 0))
+
+            if api_count > baseline_api_count or state.get("apiRequestInFlight"):
+                request_seen = True
+
+            # If request has not been sent yet, detect deterministic reject/no-progress states
+            if not request_seen:
+                if submit_clicks > baseline_submit_clicks:
+                    no_request_hits += 1
+
+                if state.get("captchaError") and not state.get("hasToken"):
                     captcha_error_hits += 1
                 else:
                     captcha_error_hits = 0
 
                 if captcha_error_hits >= captcha_error_limit:
-                    msg = "Captcha no resuelto. Intenta nuevamente."
+                    msg = "Captcha no resuelto."
                     if not self.slow_mode:
                         msg += " Sugerencia: usa ?slow=true para conexiones lentas."
-                    raise RuntimeError(msg)
+                    return {
+                        "status": "captcha_not_resolved",
+                        "error": msg,
+                    }
 
-            except RuntimeError:
-                raise
+                if no_request_hits >= no_request_limit:
+                    return {
+                        "status": "submission_not_sent",
+                        "error": "Se hizo click pero SUNARP no envió solicitud al API.",
+                    }
+            else:
+                # Request seen; only fail early on explicit runtime errors
+                api_last_error = (state.get("apiLastError") or "").strip()
+                if api_last_error:
+                    return {
+                        "status": "api_request_error",
+                        "error": f"Error de red durante solicitud SUNARP: {api_last_error}",
+                    }
+
+            await asyncio.sleep(poll_interval)
+
+        if request_seen:
+            return {
+                "status": "api_timeout",
+                "error": "Timeout esperando respuesta del API SUNARP.",
+            }
+        return {
+            "status": "submission_timeout",
+            "error": "No se detectó envío de solicitud al API SUNARP.",
+        }
+    
+    async def _wait_for_cloudflare(self, tab, timeout: int = CLOUDFLARE_TIMEOUT):
+        """Wait for Cloudflare/Turnstile to allow interaction (dynamic state-based)."""
+        loop = asyncio.get_event_loop()
+        start_time = loop.time()
+        poll_interval = 0.45 if self.slow_mode else 0.25
+        ready_hits = 0
+
+        # Ensure runtime observers exist in the current document
+        await self._inject_runtime_watchers(tab)
+
+        while (loop.time() - start_time) < timeout:
+            state = await self._get_runtime_state(tab)
+
+            if state.get("hasPlateInput"):
+                ready_hits += 1
+                if ready_hits >= 2:
+                    self._record_state(
+                        "cloudflare_ready",
+                        has_turnstile=state.get("hasTurnstile", False),
+                        button_found=state.get("buttonFound", False),
+                        button_enabled=state.get("buttonEnabled", False),
+                    )
+                    print("[INFO] Cloudflare bypass complete - input available")
+                    return True
+            else:
+                ready_hits = 0
+
+            await asyncio.sleep(poll_interval)
+
+        self._record_state("cloudflare_timeout", timeout=timeout)
+        raise TimeoutError("Cloudflare challenge did not complete in time")
+    
+    async def _fill_plate_input(self, tab, placa: str) -> bool:
+        """Fill the plate number input field using DOM events (dynamic, no fixed sleeps)."""
+        plate_json = json.dumps(placa)
+        fill_script = f"""
+        (function() {{
+            const targetPlate = {plate_json};
+            const selectors = [
+                "input#placa",
+                "input[name='placa']",
+                "input[formcontrolname='placa']",
+                "input[placeholder*='ABC']",
+                "input[type='text']"
+            ];
+
+            let input = null;
+            let selectorUsed = null;
+            for (const selector of selectors) {{
+                const found = document.querySelector(selector);
+                if (found) {{
+                    input = found;
+                    selectorUsed = selector;
+                    break;
+                }}
+            }}
+
+            if (!input) {{
+                return JSON.stringify({{ ok: false, reason: 'input-not-found' }});
+            }}
+
+            input.focus();
+            input.value = '';
+            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+
+            input.value = targetPlate;
+            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            input.dispatchEvent(new KeyboardEvent('keyup', {{ bubbles: true, key: 'Enter' }}));
+
+            return JSON.stringify({{
+                ok: true,
+                selector: selectorUsed,
+                value: input.value || ''
+            }});
+        }})();
+        """
+
+        filled = await self._run_json_script(tab, fill_script, default={"ok": False})
+        if filled.get("ok"):
+            selector = filled.get("selector", "unknown")
+            self._record_state("plate_filled", selector=selector, value=filled.get("value", ""))
+            print(f"[INFO] Plate entered using selector: {selector}")
+            return True
+
+        # Fallback to pydoll typing if direct DOM injection failed
+        input_elem = await tab.query("input[type='text']", timeout=0, raise_exc=False)
+        if input_elem:
+            try:
+                await input_elem.click()
+                await input_elem.type_text(placa)
+                self._record_state("plate_filled_fallback", selector="input[type='text']")
+                print("[INFO] Plate entered using fallback text input")
+                return True
             except Exception:
                 pass
 
-            await asyncio.sleep(0.5)
-
-        # Small delay to ensure response body is available
-        await asyncio.sleep(0.8)
-
-        # Get the response body
-        if self._pending_request_id:
-            try:
-                body = await tab.get_network_response_body(self._pending_request_id)
-                self._api_response = json.loads(body)
-                print(f"[INFO] API response body retrieved successfully")
-            except Exception as e:
-                print(f"[ERROR] Failed to get response body: {e}")
-                self._api_response = None
+        self._record_state("plate_fill_failed")
+        return False
     
-    async def _wait_for_cloudflare(self, tab, timeout: int = CLOUDFLARE_TIMEOUT):
-        """Wait for Cloudflare challenge to complete."""
-        start_time = asyncio.get_event_loop().time()
-        
-        while (asyncio.get_event_loop().time() - start_time) < timeout:
-            try:
-                # Check for the specific SUNARP input using query with find_all=True
-                plate_input = await tab.query(
-                    "input#placa, input[name='placa'], input[formcontrolname='placa']",
-                    timeout=0,
-                    raise_exc=False
-                )
-                if plate_input:
-                    print("[INFO] Cloudflare bypass complete - found plate input!")
-                    return True
-                
-                # Alternative: look for any text input
-                text_input = await tab.query(
-                    "input[type='text']",
-                    timeout=0,
-                    raise_exc=False
-                )
-                if text_input:
-                    print("[INFO] Cloudflare bypass complete - found text input!")
-                    return True
-                
-                # Check for search button by text
-                button = await tab.find(
-                    tag_name="button",
-                    text="Búsqueda",
-                    timeout=0,
-                    raise_exc=False
-                )
-                if button:
-                    print("[INFO] Cloudflare bypass complete - found search button!")
-                    return True
-                        
-            except Exception as e:
-                print(f"[DEBUG] Waiting for Cloudflare: {e}")
-            
-            await asyncio.sleep(2)
-        
-        raise TimeoutError("Cloudflare challenge did not complete in time")
-    
-    async def _fill_plate_input(self, tab, placa: str):
-        """Fill the plate number input field."""
-        selectors = [
-            "input#placa",
-            "input[name='placa']",
-            "input[formcontrolname='placa']",
-            "input[placeholder*='ABC']",
-        ]
-        
-        for selector in selectors:
-            try:
-                input_elem = await tab.query(selector, timeout=0, raise_exc=False)
-                if input_elem:
-                    await input_elem.click()
-                    await asyncio.sleep(0.3)
-                    await input_elem.type_text(placa)
-                    print(f"[INFO] Plate entered using selector: {selector}")
-                    return
-            except Exception:
-                continue
-        
-        # Fallback: find any text input
-        input_elem = await tab.query("input[type='text']", timeout=0, raise_exc=False)
-        if input_elem:
-            await input_elem.click()
-            await asyncio.sleep(0.3)
-            await input_elem.type_text(placa)
-            print("[INFO] Plate entered using fallback text input")
-            return
-        
-        raise Exception("Could not find plate input field")
-    
-    async def _click_search_button(self, tab):
-        """Click the search/busqueda button after waiting for Turnstile captcha to complete."""
-        
-        # Helper to extract value from execute_script result
-        def get_script_value(result):
-            """Extract the actual value from pydoll's execute_script response."""
-            if isinstance(result, dict):
-                if 'result' in result:
-                    inner = result['result']
-                    if isinstance(inner, dict) and 'result' in inner:
-                        inner = inner['result']
-                    if isinstance(inner, dict) and 'value' in inner:
-                        return inner['value']
-                    return inner
-            return result
-        
-        # More conservative captcha detection for unstable internet
-        max_captcha_wait = 60 if self.slow_mode else 35
-        poll_interval = 0.4
-        
-        print("[INFO] Waiting for Turnstile captcha...")
-        
-        captcha_completed = False
-        start_time = asyncio.get_event_loop().time()
-        saw_turnstile = False
-        no_turnstile_enabled_streak = 0
-        
-        while (asyncio.get_event_loop().time() - start_time) < max_captcha_wait:
-            try:
-                # Combined check: token + button state + Turnstile iframe
-                check_result = await tab.execute_script("""
-                    // Check for Turnstile response token
-                    const turnstileInput = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
-                    const tokenLength = turnstileInput && turnstileInput.value ? turnstileInput.value.length : 0;
-                    const hasToken = tokenLength > 20;
-                    
-                    // Check if button is already enabled
-                    const btn = document.querySelector('button.btn-sunarp-green');
-                    const btnEnabled = btn && !btn.disabled;
-                    
-                    // Check if turnstile iframe exists (still loading)
-                    const turnstileFrame = document.querySelector('iframe[src*="turnstile"]');
-                    const hasTurnstile = !!turnstileFrame;
+    async def _wait_for_plate_value(self, tab, placa: str, timeout: float = 20) -> bool:
+        """Wait until the plate input reflects the target value."""
+        loop = asyncio.get_event_loop()
+        start_time = loop.time()
+        poll_interval = 0.45 if self.slow_mode else 0.25
+        target = placa.strip().upper()
 
-                    // Detect visible captcha error text
-                    const bodyText = (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase();
-                    const captchaError = bodyText.includes('resuelva el captcha') || bodyText.includes('captcha no resuelto');
-                    
-                    return JSON.stringify({
-                        hasToken: hasToken,
-                        tokenLength: tokenLength,
-                        btnEnabled: btnEnabled,
-                        hasTurnstile: hasTurnstile,
-                        captchaError: captchaError
-                    });
-                """)
-                
-                status = get_script_value(check_result)
-                if isinstance(status, str):
-                    import json
-                    status = json.loads(status)
-
-                if status.get('hasTurnstile'):
-                    saw_turnstile = True
-                    no_turnstile_enabled_streak = 0
-                
-                # Best signal: explicit token present
-                if status.get('hasToken'):
-                    elapsed = asyncio.get_event_loop().time() - start_time
-                    print(f"[INFO] Captcha completed in {elapsed:.1f}s (token: {status.get('tokenLength')} chars)")
-                    captcha_completed = True
-                    break
-                
-                # Fallback for cases where Turnstile is not required/rendered
-                if not status.get('hasTurnstile') and status.get('btnEnabled'):
-                    no_turnstile_enabled_streak += 1
-                    elapsed = asyncio.get_event_loop().time() - start_time
-                    # If we never saw Turnstile, wait longer to avoid early click on slow pages
-                    if not saw_turnstile and no_turnstile_enabled_streak >= 15 and elapsed >= 6:
-                        print("[INFO] Turnstile not detected after stable wait, proceeding...")
-                        captcha_completed = True
-                        break
-                    # If Turnstile appeared before and is now gone, allow sooner
-                    if saw_turnstile and no_turnstile_enabled_streak >= 4:
-                        print("[INFO] Turnstile disappeared and button enabled, proceeding...")
-                        captcha_completed = True
-                        break
-                else:
-                    no_turnstile_enabled_streak = 0
-
-                # If we already see captcha error, keep waiting for token instead of clicking too early
-                if status.get('captchaError'):
-                    pass
-                    
-            except Exception as e:
-                pass  # Silent retry
-            
+        while (loop.time() - start_time) < timeout:
+            state = await self._get_runtime_state(tab)
+            current = (state.get("plateValue") or "").strip().upper()
+            if current == target:
+                self._record_state("plate_confirmed", value=current)
+                return True
             await asyncio.sleep(poll_interval)
-        
-        if not captcha_completed:
-            print("[WARN] Captcha wait timed out, attempting guarded click...")
-        
-        # Minimal delay before clicking
-        await asyncio.sleep(0.3)
-        
-        # Click button with guarded retries (for slow network/token propagation)
-        print("[INFO] Clicking search button...")
-        
-        result = await tab.execute_script("""
-            const btn = document.querySelector('button.btn-sunarp-green');
-            if (btn) {
-                btn.disabled = false;
-                btn.removeAttribute('disabled');
-                btn.click();
-                return 'clicked';
+
+        self._record_state("plate_confirm_timeout", expected=target)
+        return False
+
+    async def _wait_for_submission_gate(self, tab, attempt: int) -> Dict[str, Any]:
+        """Wait dynamically until submit gate is truly ready."""
+        loop = asyncio.get_event_loop()
+        start_time = loop.time()
+        timeout = CAPTCHA_WAIT_TIMEOUT * (2.0 if self.slow_mode else 1.2)
+        poll_interval = 0.45 if self.slow_mode else 0.25
+
+        saw_turnstile = False
+        stable_no_turnstile_hits = 0
+        last_state: Dict[str, Any] = {}
+
+        print("[INFO] Waiting for Turnstile captcha...")
+
+        while (loop.time() - start_time) < timeout:
+            state = await self._get_runtime_state(tab)
+            last_state = state
+
+            if state.get("hasTurnstile"):
+                saw_turnstile = True
+                stable_no_turnstile_hits = 0
+
+            if state.get("hasToken"):
+                elapsed = loop.time() - start_time
+                print(f"[INFO] Captcha completed in {elapsed:.1f}s (token: {state.get('tokenLength', 0)} chars)")
+                return {
+                    "ready": True,
+                    "gate_reason": "token_ready",
+                    **state,
+                }
+
+            # If page is explicitly complaining about captcha, never bypass by button state.
+            if state.get("captchaError") and not state.get("hasToken"):
+                stable_no_turnstile_hits = 0
+                await asyncio.sleep(poll_interval)
+                continue
+
+            # If Turnstile is absent and UI remains enabled stably, allow progression.
+            if (
+                not state.get("hasTurnstile")
+                and state.get("buttonEnabled")
+                and state.get("hasPlateInput")
+                and not state.get("captchaError")
+            ):
+                stable_no_turnstile_hits += 1
+                elapsed = loop.time() - start_time
+                threshold = 36 if self.slow_mode and not saw_turnstile else (32 if not saw_turnstile else 8)
+                min_elapsed = 12 if self.slow_mode and not saw_turnstile else (8 if not saw_turnstile else 2)
+                if stable_no_turnstile_hits >= threshold and elapsed >= min_elapsed:
+                    print("[INFO] Turnstile not required/visible, proceeding with guarded submit...")
+                    return {
+                        "ready": True,
+                        "gate_reason": "no_turnstile_stable",
+                        **state,
+                    }
+            else:
+                stable_no_turnstile_hits = 0
+
+            await asyncio.sleep(poll_interval)
+
+        msg = "Captcha no resuelto antes de enviar consulta"
+        if not self.slow_mode:
+            msg += ". Sugerencia: usa ?slow=true"
+        return {
+            "ready": False,
+            "error": msg,
+            **last_state,
+        }
+
+    async def _click_search_button(self, tab) -> bool:
+        """Perform a single guarded click on search button and record submit intent."""
+        click_script = """
+        (function() {
+            const runtime = window.__sunarpRuntime || (window.__sunarpRuntime = {});
+            runtime.submitClicks = (runtime.submitClicks || 0) + 1;
+            runtime.lastSubmitAt = Date.now();
+            if (typeof runtime.pushEvent === 'function') {
+                runtime.pushEvent('submit_click_attempt', { count: runtime.submitClicks });
             }
-            return 'not-found';
-        """)
-        clicked = get_script_value(result)
-        
-        if clicked == 'clicked':
-            print("[INFO] Search button clicked")
-            await asyncio.sleep(1.2)
 
-            # If captcha error appears immediately, retry a few times waiting for token propagation
-            for attempt in range(1, 4):
-                try:
-                    post_click = await tab.execute_script("""
-                        const bodyText = (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase();
-                        const tokenInput = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
-                        const tokenLength = tokenInput && tokenInput.value ? tokenInput.value.length : 0;
-                        const hasToken = tokenLength > 20;
-                        const captchaError = bodyText.includes('resuelva el captcha') || bodyText.includes('captcha no resuelto');
-                        return JSON.stringify({ hasToken, captchaError, tokenLength });
-                    """)
-                    post_click = get_script_value(post_click)
-                    if isinstance(post_click, str):
-                        post_click = json.loads(post_click)
+            let btn = document.querySelector('button.btn-sunarp-green, button.ant-btn-primary');
 
-                    if not post_click.get('captchaError'):
-                        return
-
-                    if post_click.get('hasToken'):
-                        print(f"[INFO] Captcha token available after click, retrying submit (attempt {attempt})")
-                        await asyncio.sleep(0.9)
-                        await tab.execute_script("""
-                            const btn = document.querySelector('button.btn-sunarp-green, button.ant-btn-primary');
-                            if (btn) { btn.disabled = false; btn.removeAttribute('disabled'); btn.click(); }
-                        """)
-                        await asyncio.sleep(1.0)
-                    else:
-                        await asyncio.sleep(1.0)
-                except Exception:
-                    await asyncio.sleep(0.8)
-            return
-        
-        # Fallback: try ant-btn-primary
-        result = await tab.execute_script("""
-            const btn = document.querySelector('button.ant-btn-primary');
-            if (btn) {
-                btn.disabled = false;
-                btn.removeAttribute('disabled');
-                btn.click();
-                return 'clicked';
-            }
-            return 'not-found';
-        """)
-        clicked = get_script_value(result)
-        
-        if clicked == 'clicked':
-            print("[INFO] Search button clicked (fallback)")
-            return
-        
-        # Last resort: find by text
-        result = await tab.execute_script("""
-            const buttons = document.querySelectorAll('button');
-            for (const btn of buttons) {
-                const text = (btn.innerText || '').toLowerCase();
-                if (text.includes('busqueda') || text.includes('buscar')) {
-                    btn.disabled = false;
-                    btn.removeAttribute('disabled');
-                    btn.click();
-                    return 'clicked';
+            if (!btn) {
+                const buttons = document.querySelectorAll('button');
+                for (const candidate of buttons) {
+                    const text = (candidate.innerText || '').toLowerCase();
+                    if (text.includes('busqueda') || text.includes('buscar') || text.includes('consulta')) {
+                        btn = candidate;
+                        break;
+                    }
                 }
             }
-            return 'not-found';
-        """)
-        clicked = get_script_value(result)
-        
-        if clicked == 'clicked':
-            print("[INFO] Search button clicked (by text)")
-            return
-        
-        raise Exception("Could not find or click search button")
+
+            if (!btn) {
+                return JSON.stringify({ clicked: false, reason: 'button-not-found' });
+            }
+
+            btn.disabled = false;
+            btn.removeAttribute('disabled');
+            btn.click();
+
+            if (typeof runtime.pushEvent === 'function') {
+                runtime.pushEvent('submit_clicked', {
+                    text: (btn.innerText || '').trim().slice(0, 60)
+                });
+            }
+
+            return JSON.stringify({
+                clicked: true,
+                text: (btn.innerText || '').trim().slice(0, 60)
+            });
+        })();
+        """
+
+        click_result = await self._run_json_script(tab, click_script, default={"clicked": False})
+        clicked = bool(click_result.get("clicked"))
+        if clicked:
+            self._record_state("submit_clicked", button_text=click_result.get("text", ""))
+            print("[INFO] Search button clicked")
+            return True
+
+        self._record_state("submit_click_failed", reason=click_result.get("reason", "unknown"))
+        return False
     
     async def _process_api_response(self, response_data: Dict[str, Any], placa: str) -> ConsultaResult:
         """Process the intercepted API response and save the image."""

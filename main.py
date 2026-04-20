@@ -187,6 +187,16 @@ async def consultar_vehiculo(
                         status_code=409,
                         detail=result.error
                     )
+                if "sunarp no envió solicitud" in error_text or "no se detectó envío" in error_text:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=result.error
+                    )
+                if "error de red durante solicitud sunarp" in error_text:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=result.error
+                    )
                 if "timeout waiting for api response" in error_text:
                     raise HTTPException(
                         status_code=504,
