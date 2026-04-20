@@ -25,7 +25,12 @@ SUNARP_URL = "https://consultavehicular.sunarp.gob.pe/consulta-vehicular/inicio"
 SUNARP_API_URL = "api-gateway.sunarp.gob.pe"
 SUNARP_API_ENDPOINT = "getDatosVehiculo"
 DOWNLOADS_DIR = Path(__file__).parent / "downloads"
-CHROMIUM_PATH = "/usr/bin/chromium-browser"
+CHROMIUM_CANDIDATE_PATHS = [
+    os.getenv("SUNARP_CHROMIUM_PATH", "").strip(),
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+    "/snap/bin/chromium",
+]
 
 # Timeouts (in seconds) - generous for slow connections
 PAGE_LOAD_TIMEOUT = 60       # Increased for slow internet
@@ -445,9 +450,11 @@ class SunarpScraper:
         """Configure Chrome options to appear as genuine Google Chrome."""
         options = ChromiumOptions()
         
-        # Set browser path
-        if os.path.exists(CHROMIUM_PATH):
-            options.binary_location = CHROMIUM_PATH
+        # Set browser path (supports local and Docker paths)
+        for browser_path in CHROMIUM_CANDIDATE_PATHS:
+            if browser_path and os.path.exists(browser_path):
+                options.binary_location = browser_path
+                break
         
         # === CRITICAL: Disable automation detection ===
         options.add_argument("--disable-blink-features=AutomationControlled")
