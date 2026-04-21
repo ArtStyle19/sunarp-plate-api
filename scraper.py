@@ -32,11 +32,80 @@ CHROMIUM_CANDIDATE_PATHS = [
     "/snap/bin/chromium",
 ]
 
-# Timeouts (in seconds) - generous for slow connections
-PAGE_LOAD_TIMEOUT = 60       # Increased for slow internet
-CLOUDFLARE_TIMEOUT = 180     # Turnstile can be slow on bad connections
-RESULT_TIMEOUT = 90          # API response timeout
-CAPTCHA_WAIT_TIMEOUT = 60    # Time to wait for captcha to auto-solve
+def _env_float(name: str, default: float) -> float:
+    """Read float from environment with safe fallback."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read integer from environment with safe fallback."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _positive_float(value: float, fallback: float, minimum: float = 0.1) -> float:
+    """Return positive float with minimum guard and fallback."""
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if val < minimum:
+        return fallback
+    return val
+
+
+def _positive_int(value: int, fallback: int, minimum: int = 1) -> int:
+    """Return positive integer with minimum guard and fallback."""
+    try:
+        val = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    if val < minimum:
+        return fallback
+    return val
+
+
+# Baseline watchdogs (seconds)
+PAGE_LOAD_TIMEOUT = _env_float("SUNARP_PAGE_LOAD_TIMEOUT", 60)
+CLOUDFLARE_TIMEOUT = _env_float("SUNARP_CLOUDFLARE_TIMEOUT", 180)
+RESULT_TIMEOUT = _env_float("SUNARP_RESULT_TIMEOUT", 90)
+CAPTCHA_WAIT_TIMEOUT = _env_float("SUNARP_CAPTCHA_WAIT_TIMEOUT", 20)
+
+# Latency profile (dynamic, progress-aware)
+FAST_TARGET_SECONDS = _env_float("SUNARP_FAST_TARGET_SECONDS", 12.0)
+TOTAL_BUDGET_SECONDS = _env_float("SUNARP_TOTAL_BUDGET_SECONDS", 18.0)
+TOTAL_BUDGET_SLOW_SECONDS = _env_float("SUNARP_TOTAL_BUDGET_SLOW_SECONDS", 75.0)
+
+GATE_INITIAL_SECONDS = _env_float("SUNARP_GATE_INITIAL_SECONDS", 8.0)
+GATE_RETRY_SECONDS = _env_float("SUNARP_GATE_RETRY_SECONDS", 4.0)
+GATE_INITIAL_SECONDS_SLOW = _env_float("SUNARP_GATE_INITIAL_SECONDS_SLOW", 20.0)
+GATE_RETRY_SECONDS_SLOW = _env_float("SUNARP_GATE_RETRY_SECONDS_SLOW", 12.0)
+
+API_WAIT_SECONDS = _env_float("SUNARP_API_WAIT_SECONDS", 6.0)
+API_WAIT_SECONDS_SLOW = _env_float("SUNARP_API_WAIT_SECONDS_SLOW", 16.0)
+
+NO_PROGRESS_FAIL_SECONDS = _env_float("SUNARP_NO_PROGRESS_FAIL_SECONDS", 3.5)
+NO_PROGRESS_FAIL_SECONDS_SLOW = _env_float("SUNARP_NO_PROGRESS_FAIL_SECONDS_SLOW", 8.0)
+
+PROGRESS_EXTENSION_SECONDS = _env_float("SUNARP_PROGRESS_EXTENSION_SECONDS", 6.0)
+MAX_PROGRESS_EXTENSIONS = _env_int("SUNARP_MAX_PROGRESS_EXTENSIONS", 2)
+MAX_PROGRESS_EXTENSIONS_SLOW = _env_int("SUNARP_MAX_PROGRESS_EXTENSIONS_SLOW", 4)
+
+MAX_SUBMIT_ATTEMPTS = _env_int("SUNARP_MAX_SUBMIT_ATTEMPTS", 2)
+MAX_SUBMIT_ATTEMPTS_SLOW = _env_int("SUNARP_MAX_SUBMIT_ATTEMPTS_SLOW", 3)
+
+REQUIRE_TOKEN_ON_RETRY = os.getenv("SUNARP_REQUIRE_TOKEN_ON_RETRY", "true").lower() == "true"
 
 
 @dataclass
@@ -233,6 +302,42 @@ class SunarpScraper:
                     return inner["value"]
                 return inner
         return result
+
+    def _get_timing_profile(self) -> Dict[str, Any]:
+        """Get validated timing profile for current mode."""
+        if self.slow_mode:
+            total_budget_seconds = _positive_float(TOTAL_BUDGET_SLOW_SECONDS, 75.0)
+            gate_initial_seconds = _positive_float(GATE_INITIAL_SECONDS_SLOW, 20.0)
+            gate_retry_seconds = _positive_float(GATE_RETRY_SECONDS_SLOW, 12.0)
+            api_wait_seconds = _positive_float(API_WAIT_SECONDS_SLOW, 16.0)
+            no_progress_fail_seconds = _positive_float(NO_PROGRESS_FAIL_SECONDS_SLOW, 8.0)
+            max_progress_extensions = _positive_int(MAX_PROGRESS_EXTENSIONS_SLOW, 4, minimum=0)
+            max_submit_attempts = _positive_int(MAX_SUBMIT_ATTEMPTS_SLOW, 3)
+        else:
+            total_budget_seconds = _positive_float(TOTAL_BUDGET_SECONDS, 18.0)
+            gate_initial_seconds = _positive_float(GATE_INITIAL_SECONDS, 8.0)
+            gate_retry_seconds = _positive_float(GATE_RETRY_SECONDS, 4.0)
+            api_wait_seconds = _positive_float(API_WAIT_SECONDS, 6.0)
+            no_progress_fail_seconds = _positive_float(NO_PROGRESS_FAIL_SECONDS, 3.5)
+            max_progress_extensions = _positive_int(MAX_PROGRESS_EXTENSIONS, 2, minimum=0)
+            max_submit_attempts = _positive_int(MAX_SUBMIT_ATTEMPTS, 2)
+
+        # Keep reasonable floor to avoid immediate timeout loops
+        progress_extension_seconds = _positive_float(PROGRESS_EXTENSION_SECONDS, 6.0)
+        fast_target_seconds = _positive_float(FAST_TARGET_SECONDS, 12.0)
+
+        return {
+            "fast_target_seconds": fast_target_seconds,
+            "total_budget_seconds": total_budget_seconds,
+            "gate_initial_seconds": gate_initial_seconds,
+            "gate_retry_seconds": gate_retry_seconds,
+            "api_wait_seconds": api_wait_seconds,
+            "no_progress_fail_seconds": no_progress_fail_seconds,
+            "progress_extension_seconds": progress_extension_seconds,
+            "max_progress_extensions": max_progress_extensions,
+            "max_submit_attempts": max_submit_attempts,
+            "require_token_on_retry": bool(REQUIRE_TOKEN_ON_RETRY),
+        }
 
     async def _run_json_script(self, tab, script: str, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Execute script and parse JSON result safely."""
@@ -559,9 +664,6 @@ class SunarpScraper:
             tab = await browser.start()
             self._tab = tab
             
-            # Adaptive watchdog timeout (control flow remains state-driven)
-            result_timeout = RESULT_TIMEOUT * (1.8 if self.slow_mode else 1.2)
-            
             # Enable page events to track navigation
             print(f"[INFO] Enabling page events...")
             await tab.enable_page_events()
@@ -606,20 +708,79 @@ class SunarpScraper:
             if not plate_ok:
                 return self._build_failure_result(placa, "La placa no quedó registrada en el formulario")
 
-            max_submit_attempts = 3 if self.slow_mode else 2
+            timing = self._get_timing_profile()
+            loop = asyncio.get_event_loop()
+            request_window_start = loop.time()
+            request_deadline = request_window_start + timing["total_budget_seconds"]
+
+            self._record_state(
+                "timing_profile",
+                fast_target_seconds=timing["fast_target_seconds"],
+                total_budget_seconds=timing["total_budget_seconds"],
+                gate_initial_seconds=timing["gate_initial_seconds"],
+                gate_retry_seconds=timing["gate_retry_seconds"],
+                api_wait_seconds=timing["api_wait_seconds"],
+                no_progress_fail_seconds=timing["no_progress_fail_seconds"],
+                progress_extension_seconds=timing["progress_extension_seconds"],
+                max_progress_extensions=timing["max_progress_extensions"],
+                max_submit_attempts=timing["max_submit_attempts"],
+                require_token_on_retry=timing["require_token_on_retry"],
+            )
+
+            max_submit_attempts = timing["max_submit_attempts"]
             attempts_used = 0
             last_error = "No API response received"
+            saw_turnstile = False
+            saw_token = False
+            remaining_progress_extensions = timing["max_progress_extensions"]
 
             for attempt in range(1, max_submit_attempts + 1):
                 attempts_used = attempt
-                self._record_state("submit_attempt_start", attempt=attempt)
+                remaining_budget = request_deadline - loop.time()
+                if remaining_budget <= 0:
+                    last_error = "SUNARP no envió solicitud al API (presupuesto agotado)."
+                    self._record_state("request_budget_exhausted", attempt=attempt)
+                    break
+
+                gate_window = (
+                    timing["gate_initial_seconds"]
+                    if attempt == 1
+                    else timing["gate_retry_seconds"]
+                )
+                gate_timeout = min(remaining_budget, gate_window)
+                require_token = bool(
+                    attempt > 1
+                    and timing["require_token_on_retry"]
+                    and (
+                        saw_turnstile
+                        or saw_token
+                        or "captcha" in (last_error or "").lower()
+                    )
+                )
+
+                self._record_state(
+                    "submit_attempt_start",
+                    attempt=attempt,
+                    remaining_budget=round(remaining_budget, 2),
+                    gate_timeout=round(gate_timeout, 2),
+                    require_token=require_token,
+                    remaining_progress_extensions=remaining_progress_extensions,
+                )
 
                 # Reset response tracking for this attempt
                 self._api_response = None
                 self._response_event.clear()
                 self._pending_request_id = None
 
-                gate_state = await self._wait_for_submission_gate(tab, attempt=attempt)
+                gate_state = await self._wait_for_submission_gate(
+                    tab,
+                    attempt=attempt,
+                    timeout_seconds=gate_timeout,
+                    require_token=require_token,
+                )
+                saw_turnstile = saw_turnstile or bool(gate_state.get("hasTurnstile"))
+                saw_token = saw_token or bool(gate_state.get("hasToken"))
+
                 if not gate_state.get("ready"):
                     last_error = gate_state.get("error", "Captcha no resuelto")
                     self._record_state("submit_gate_failed", attempt=attempt, error=last_error)
@@ -643,14 +804,42 @@ class SunarpScraper:
                         continue
                     return self._build_failure_result(placa, last_error, attempts=attempts_used)
 
-                print(f"[INFO] Waiting for API response (attempt {attempt}/{max_submit_attempts})...")
+                remaining_budget_after_click = request_deadline - loop.time()
+                if remaining_budget_after_click <= 0:
+                    last_error = "SUNARP no envió solicitud al API (presupuesto agotado)."
+                    self._record_state(
+                        "request_budget_exhausted",
+                        attempt=attempt,
+                        stage="after_submit_click",
+                    )
+                    break
+
+                initial_api_wait = min(
+                    timing["api_wait_seconds"],
+                    remaining_budget_after_click,
+                )
+                print(
+                    f"[INFO] Waiting for API response (attempt {attempt}/{max_submit_attempts}, "
+                    f"window={initial_api_wait:.1f}s, budget_left={remaining_budget_after_click:.1f}s)..."
+                )
+
                 outcome = await self._wait_for_api_response(
                     tab,
-                    result_timeout=result_timeout,
                     attempt=attempt,
-                    baseline_api_count=int(gate_state.get("apiRequestCount", 0)),
-                    baseline_submit_clicks=int(gate_state.get("submitClicks", 0)),
+                    baseline_state=gate_state,
+                    initial_wait_seconds=initial_api_wait,
+                    total_deadline=request_deadline,
+                    no_progress_fail_seconds=timing["no_progress_fail_seconds"],
+                    progress_extension_seconds=timing["progress_extension_seconds"],
+                    max_progress_extensions=remaining_progress_extensions,
                 )
+
+                extensions_used = int(outcome.get("extensions_used", 0) or 0)
+                if extensions_used > 0:
+                    remaining_progress_extensions = max(
+                        0,
+                        remaining_progress_extensions - extensions_used,
+                    )
 
                 if outcome.get("status") == "response_ready" and self._api_response:
                     self._record_state("submit_attempt_success", attempt=attempt)
@@ -665,8 +854,11 @@ class SunarpScraper:
                 )
 
                 if attempt < max_submit_attempts:
+                    if (request_deadline - loop.time()) <= 0:
+                        self._record_state("request_budget_exhausted", attempt=attempt, stage="before_retry")
+                        break
                     # Re-ensure plate value before retrying
-                    await self._wait_for_plate_value(tab, placa, timeout=10)
+                    await self._wait_for_plate_value(tab, placa, timeout=min(10, max(1.0, request_deadline - loop.time())))
                     continue
 
             # Process final outcome
@@ -1025,24 +1217,74 @@ class SunarpScraper:
     async def _wait_for_api_response(
         self,
         tab,
-        result_timeout: float,
         attempt: int,
-        baseline_api_count: int,
-        baseline_submit_clicks: int,
+        baseline_state: Dict[str, Any],
+        initial_wait_seconds: float,
+        total_deadline: float,
+        no_progress_fail_seconds: float,
+        progress_extension_seconds: float,
+        max_progress_extensions: int,
     ) -> Dict[str, Any]:
-        """Wait dynamically for API response or deterministic failure state."""
+        """Wait for API response with progress-aware extensions and global budget cap."""
         loop = asyncio.get_event_loop()
-        start_time = loop.time()
-        poll_interval = 0.45 if self.slow_mode else 0.25
+        poll_interval = 0.45 if self.slow_mode else 0.22
+        started_at = loop.time()
+
+        initial_wait = _positive_float(initial_wait_seconds, 2.0)
+        no_progress_fail = _positive_float(no_progress_fail_seconds, 3.5)
+        extension_size = _positive_float(progress_extension_seconds, 4.0)
+        extensions_allowed = _positive_int(max_progress_extensions, 0, minimum=0)
+
+        active_deadline = min(total_deadline, started_at + initial_wait)
+
+        observed_api_count = int(baseline_state.get("apiRequestCount", 0) or 0)
+        observed_submit_clicks = int(baseline_state.get("submitClicks", 0) or 0)
+        observed_event_count = int(baseline_state.get("eventCount", 0) or 0)
+        observed_last_response_at = int(baseline_state.get("apiLastResponseAt", 0) or 0)
 
         request_seen = False
+        last_progress_at = started_at
+        extensions_used = 0
         captcha_error_hits = 0
-        no_request_hits = 0
 
-        captcha_error_limit = 40 if self.slow_mode else 22
-        no_request_limit = 40 if self.slow_mode else 24
+        self._record_state(
+            "api_wait_start",
+            attempt=attempt,
+            initial_wait_seconds=round(initial_wait, 2),
+            no_progress_fail_seconds=round(no_progress_fail, 2),
+            extensions_allowed=extensions_allowed,
+            extension_size_seconds=round(extension_size, 2),
+        )
 
-        while (loop.time() - start_time) < result_timeout:
+        while True:
+            now = loop.time()
+            if now >= total_deadline:
+                self._record_state("request_budget_exhausted", attempt=attempt, stage="api_wait")
+                if request_seen:
+                    return {
+                        "status": "api_timeout",
+                        "error": "Timeout waiting for API response from SUNARP.",
+                        "extensions_used": extensions_used,
+                    }
+                return {
+                    "status": "submission_timeout",
+                    "error": "No se detectó envío de solicitud al API SUNARP.",
+                    "extensions_used": extensions_used,
+                }
+
+            if now >= active_deadline:
+                if request_seen:
+                    return {
+                        "status": "api_timeout",
+                        "error": "Timeout waiting for API response from SUNARP.",
+                        "extensions_used": extensions_used,
+                    }
+                return {
+                    "status": "submission_timeout",
+                    "error": "No se detectó envío de solicitud al API SUNARP.",
+                    "extensions_used": extensions_used,
+                }
+
             # Fast path: network callback has intercepted API response
             if self._response_event.is_set() and self._pending_request_id:
                 for body_try in range(4):
@@ -1054,9 +1296,13 @@ class SunarpScraper:
                             attempt=attempt,
                             request_id=self._pending_request_id,
                             body_try=body_try + 1,
+                            extensions_used=extensions_used,
                         )
                         print(f"[INFO] API response body retrieved successfully")
-                        return {"status": "response_ready"}
+                        return {
+                            "status": "response_ready",
+                            "extensions_used": extensions_used,
+                        }
                     except Exception as e:
                         if body_try == 3:
                             self._record_state(
@@ -1068,56 +1314,99 @@ class SunarpScraper:
                         await asyncio.sleep(poll_interval)
 
             state = await self._get_runtime_state(tab)
-            api_count = int(state.get("apiRequestCount", 0))
-            submit_clicks = int(state.get("submitClicks", 0))
+            api_count = int(state.get("apiRequestCount", 0) or 0)
+            submit_clicks = int(state.get("submitClicks", 0) or 0)
+            event_count = int(state.get("eventCount", 0) or 0)
+            api_last_response_at = int(state.get("apiLastResponseAt", 0) or 0)
+            api_last_error = (state.get("apiLastError") or "").strip()
 
-            if api_count > baseline_api_count or state.get("apiRequestInFlight"):
+            progress_reasons: List[str] = []
+
+            if api_count > observed_api_count:
+                observed_api_count = api_count
                 request_seen = True
+                progress_reasons.append("api_request_count")
 
-            # If request has not been sent yet, detect deterministic reject/no-progress states
-            if not request_seen:
-                if submit_clicks > baseline_submit_clicks:
-                    no_request_hits += 1
+            if state.get("apiRequestInFlight"):
+                request_seen = True
+                progress_reasons.append("api_in_flight")
 
-                if state.get("captchaError") and not state.get("hasToken"):
-                    captcha_error_hits += 1
-                else:
-                    captcha_error_hits = 0
+            if api_last_response_at > observed_last_response_at:
+                observed_last_response_at = api_last_response_at
+                request_seen = True
+                progress_reasons.append("api_response_event")
 
-                if captcha_error_hits >= captcha_error_limit:
-                    msg = "Captcha no resuelto."
+            if event_count > observed_event_count:
+                last_event_type = (state.get("lastEventType") or "").strip()
+                if last_event_type.startswith("api_"):
+                    request_seen = True
+                    progress_reasons.append(last_event_type)
+                observed_event_count = event_count
+
+            if api_last_error:
+                return {
+                    "status": "api_request_error",
+                    "error": f"Error de red durante solicitud SUNARP: {api_last_error}",
+                    "extensions_used": extensions_used,
+                }
+
+            if state.get("captchaError") and not state.get("hasToken") and not request_seen:
+                captcha_error_hits += 1
+            else:
+                captcha_error_hits = 0
+
+            if captcha_error_hits >= (3 if self.slow_mode else 2):
+                msg = "Captcha no resuelto."
+                if not self.slow_mode:
+                    msg += " Sugerencia: usa ?slow=true para conexiones lentas."
+                return {
+                    "status": "captcha_not_resolved",
+                    "error": msg,
+                    "extensions_used": extensions_used,
+                }
+
+            if progress_reasons:
+                now = loop.time()
+                last_progress_at = now
+
+                self._record_state(
+                    "api_progress",
+                    attempt=attempt,
+                    reasons=",".join(progress_reasons[:4]),
+                    api_count=api_count,
+                    in_flight=bool(state.get("apiRequestInFlight")),
+                )
+
+                time_left_in_window = active_deadline - now
+                if (
+                    extensions_used < extensions_allowed
+                    and extension_size > 0
+                    and time_left_in_window <= max(1.0, extension_size * 0.5)
+                ):
+                    extend_by = min(extension_size, max(0.0, total_deadline - active_deadline))
+                    if extend_by > 0:
+                        active_deadline += extend_by
+                        extensions_used += 1
+                        self._record_state(
+                            "api_wait_extended",
+                            attempt=attempt,
+                            extend_by=round(extend_by, 2),
+                            extensions_used=extensions_used,
+                            window_remaining=round(active_deadline - now, 2),
+                            budget_remaining=round(total_deadline - now, 2),
+                        )
+            elif not request_seen and (loop.time() - last_progress_at) >= no_progress_fail:
+                if submit_clicks > observed_submit_clicks:
+                    msg = "SUNARP no envió solicitud al API."
                     if not self.slow_mode:
                         msg += " Sugerencia: usa ?slow=true para conexiones lentas."
                     return {
-                        "status": "captcha_not_resolved",
-                        "error": msg,
-                    }
-
-                if no_request_hits >= no_request_limit:
-                    return {
                         "status": "submission_not_sent",
-                        "error": "Se hizo click pero SUNARP no envió solicitud al API.",
-                    }
-            else:
-                # Request seen; only fail early on explicit runtime errors
-                api_last_error = (state.get("apiLastError") or "").strip()
-                if api_last_error:
-                    return {
-                        "status": "api_request_error",
-                        "error": f"Error de red durante solicitud SUNARP: {api_last_error}",
+                        "error": msg,
+                        "extensions_used": extensions_used,
                     }
 
             await asyncio.sleep(poll_interval)
-
-        if request_seen:
-            return {
-                "status": "api_timeout",
-                "error": "Timeout esperando respuesta del API SUNARP.",
-            }
-        return {
-            "status": "submission_timeout",
-            "error": "No se detectó envío de solicitud al API SUNARP.",
-        }
     
     async def _wait_for_cloudflare(self, tab, timeout: int = CLOUDFLARE_TIMEOUT):
         """Wait for Cloudflare/Turnstile to allow interaction (dynamic state-based)."""
@@ -1237,18 +1526,31 @@ class SunarpScraper:
         self._record_state("plate_confirm_timeout", expected=target)
         return False
 
-    async def _wait_for_submission_gate(self, tab, attempt: int) -> Dict[str, Any]:
-        """Wait dynamically until submit gate is truly ready."""
+    async def _wait_for_submission_gate(
+        self,
+        tab,
+        attempt: int,
+        timeout_seconds: float,
+        require_token: bool = False,
+    ) -> Dict[str, Any]:
+        """Wait until submit gate is ready, with strict token mode on retries when needed."""
         loop = asyncio.get_event_loop()
         start_time = loop.time()
-        timeout = CAPTCHA_WAIT_TIMEOUT * (2.0 if self.slow_mode else 1.2)
-        poll_interval = 0.45 if self.slow_mode else 0.25
+        timeout = _positive_float(timeout_seconds, CAPTCHA_WAIT_TIMEOUT, minimum=0.8)
+        poll_interval = 0.45 if self.slow_mode else 0.22
 
         saw_turnstile = False
+        strict_token = bool(require_token)
         stable_no_turnstile_hits = 0
+        captcha_error_hits = 0
         last_state: Dict[str, Any] = {}
 
-        print("[INFO] Waiting for Turnstile captcha...")
+        self._record_state(
+            "submit_gate_wait_start",
+            attempt=attempt,
+            timeout_seconds=round(timeout, 2),
+            require_token=bool(require_token),
+        )
 
         while (loop.time() - start_time) < timeout:
             state = await self._get_runtime_state(tab)
@@ -1256,6 +1558,7 @@ class SunarpScraper:
 
             if state.get("hasTurnstile"):
                 saw_turnstile = True
+                strict_token = True
                 stable_no_turnstile_hits = 0
 
             if state.get("hasToken"):
@@ -1267,25 +1570,41 @@ class SunarpScraper:
                     **state,
                 }
 
-            # If page is explicitly complaining about captcha, never bypass by button state.
             if state.get("captchaError") and not state.get("hasToken"):
+                captcha_error_hits += 1
+                strict_token = True
                 stable_no_turnstile_hits = 0
+
+                if captcha_error_hits >= (3 if self.slow_mode else 2):
+                    msg = "Captcha no resuelto."
+                    if not self.slow_mode:
+                        msg += " Sugerencia: usa ?slow=true para conexiones lentas."
+                    return {
+                        "ready": False,
+                        "error": msg,
+                        **state,
+                    }
+
                 await asyncio.sleep(poll_interval)
                 continue
 
-            # If Turnstile is absent and UI remains enabled stably, allow progression.
+            captcha_error_hits = 0
+
+            # Allow no-turnstile path only when gate is stable and token is not required.
             if (
-                not state.get("hasTurnstile")
+                not strict_token
+                and not state.get("hasTurnstile")
                 and state.get("buttonEnabled")
                 and state.get("hasPlateInput")
                 and not state.get("captchaError")
             ):
                 stable_no_turnstile_hits += 1
                 elapsed = loop.time() - start_time
-                threshold = 36 if self.slow_mode and not saw_turnstile else (32 if not saw_turnstile else 8)
-                min_elapsed = 12 if self.slow_mode and not saw_turnstile else (8 if not saw_turnstile else 2)
-                if stable_no_turnstile_hits >= threshold and elapsed >= min_elapsed:
-                    print("[INFO] Turnstile not required/visible, proceeding with guarded submit...")
+                min_hits = 8 if self.slow_mode else 6
+                min_elapsed = 2.5 if self.slow_mode else 1.2
+
+                if stable_no_turnstile_hits >= min_hits and elapsed >= min_elapsed:
+                    print("[INFO] Turnstile not visible, proceeding with guarded submit")
                     return {
                         "ready": True,
                         "gate_reason": "no_turnstile_stable",
@@ -1296,9 +1615,13 @@ class SunarpScraper:
 
             await asyncio.sleep(poll_interval)
 
-        msg = "Captcha no resuelto antes de enviar consulta"
-        if not self.slow_mode:
-            msg += ". Sugerencia: usa ?slow=true"
+        if strict_token or saw_turnstile:
+            msg = "Captcha no resuelto antes de enviar consulta"
+            if not self.slow_mode:
+                msg += ". Sugerencia: usa ?slow=true"
+        else:
+            msg = "Formulario no quedó listo para enviar consulta"
+
         return {
             "ready": False,
             "error": msg,
